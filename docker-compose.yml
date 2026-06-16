@@ -12,5 +12,20 @@ services:
     volumes:
       - notification-pgdata:/var/lib/postgresql/data
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: notification-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      # AMQP protocol port
+      - "5672:5672"
+      # Management UI: http://localhost:15672 (guest/guest)
+      - "15672:15672"
+    volumes:
+      - notification-rabbitmq:/var/lib/rabbitmq
+
 volumes:
   notification-pgdata:
+  notification-rabbitmq:
