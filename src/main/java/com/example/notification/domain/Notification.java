@@ -37,6 +37,14 @@ public class Notification {
     @Column
     private Instant sentAt;
 
+    /** Number of delivery attempts made so far (incremented at the start of each attempt). */
+    @Column(nullable = false)
+    private int attempts;
+
+    /** Populated when the notification is dead-lettered; null otherwise. */
+    @Column
+    private String failureReason;
+
     protected Notification() {
         // for JPA
     }
@@ -48,6 +56,7 @@ public class Notification {
         this.message = message;
         this.status = NotificationStatus.PENDING;
         this.createdAt = Instant.now();
+        this.attempts = 0;
     }
 
     public void markSent(Instant sentAt) {
@@ -57,6 +66,17 @@ public class Notification {
 
     public void markFailed() {
         this.status = NotificationStatus.FAILED;
+    }
+
+    /** Marks the notification permanently failed (retries exhausted, dead-lettered). */
+    public void markDead(String failureReason) {
+        this.status = NotificationStatus.DEAD;
+        this.failureReason = failureReason;
+    }
+
+    /** Records that another delivery attempt is starting and returns the new count. */
+    public int incrementAttempts() {
+        return ++this.attempts;
     }
 
     public UUID getId() {
@@ -85,5 +105,13 @@ public class Notification {
 
     public Instant getSentAt() {
         return sentAt;
+    }
+
+    public int getAttempts() {
+        return attempts;
+    }
+
+    public String getFailureReason() {
+        return failureReason;
     }
 }
