@@ -1,11 +1,21 @@
-# Test configuration: in-memory H2 so the suite runs without Postgres/Docker.
+# Test configuration. Postgres and RabbitMQ connection details are supplied at
+# runtime by Testcontainers (@ServiceConnection); only the bits that differ from
+# those defaults live here.
 spring:
-  datasource:
-    url: jdbc:h2:mem:notifications;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
-    username: sa
-    password: ""
-    driver-class-name: org.h2.Driver
   jpa:
     hibernate:
       ddl-auto: create-drop
     open-in-view: false
+  rabbitmq:
+    listener:
+      simple:
+        concurrency: 4
+        prefetch: 1
+        acknowledge-mode: auto
+        default-requeue-rejected: false
+        retry:
+          enabled: true
+          max-attempts: 4
+          initial-interval: 1000
+          multiplier: 2.0
+          max-interval: 10000

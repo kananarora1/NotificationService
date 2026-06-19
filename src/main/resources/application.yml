@@ -12,6 +12,23 @@ spring:
       hibernate:
         format_sql: true
     open-in-view: false
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        concurrency: 4        # mirror v2's 4 workers
+        prefetch: 1           # fair dispatch: one unacked message per consumer
+        acknowledge-mode: auto
+        default-requeue-rejected: false   # exhausted retries are dead-lettered, not requeued
+        retry:
+          enabled: true
+          max-attempts: 4
+          initial-interval: 1000   # 1s before the first retry
+          multiplier: 2.0          # then 2s, 4s, ...
+          max-interval: 10000      # capped at 10s
 
 server:
   port: 8080
