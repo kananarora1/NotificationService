@@ -16,6 +16,8 @@ public record NotificationView(
         Channel channel,
         String message,
         NotificationStatus status,
+        int attempts,
+        String failureReason,
         Instant createdAt,
         Instant sentAt
 ) {
@@ -27,6 +29,8 @@ public record NotificationView(
                 n.getChannel(),
                 n.getMessage(),
                 n.getStatus(),
+                n.getAttempts(),
+                n.getFailureReason(),
                 n.getCreatedAt(),
                 n.getSentAt()
         );
