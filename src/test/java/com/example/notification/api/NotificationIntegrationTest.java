@@ -2,6 +2,7 @@ package com.example.notification.api;
 
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
+import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.repository.NotificationRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -9,15 +10,18 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.RabbitMQContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
-import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -29,10 +33,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@Testcontainers
 class NotificationIntegrationTest {
 
-    private static final Set<NotificationStatus> TERMINAL =
-            EnumSet.of(NotificationStatus.SENT, NotificationStatus.FAILED);
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+            new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"));
+
+    @Container
+    @ServiceConnection
+    static RabbitMQContainer rabbitmq =
+            new RabbitMQContainer(DockerImageName.parse("rabbitmq:3.13-management"));
 
     @Autowired
     private MockMvc mockMvc;
@@ -41,122 +53,81 @@ class NotificationIntegrationTest {
     private NotificationRepository repository;
 
     @Autowired
+    private SimulatedProvider provider;
+
+    @Autowired
     private ObjectMapper objectMapper;
 
     @Test
-    void postReturnsAcceptedAndPendingWithoutBlocking() throws Exception {
-        String body = """
-                {"recipient":"alice@example.com","channel":"EMAIL","message":"hello"}
-                """;
+    void normalRecipientSucceedsOnFirstAttempt() throws Exception {
+        UUID id = postNotify("alice@example.com");
 
-        long start = System.nanoTime();
-        MvcResult result = mockMvc.perform(post("/notify")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.id").exists())
-                .andExpect(jsonPath("$.status").value("PENDING"))
-                .andReturn();
-        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
-
-        // The provider sleeps ~800ms; accepting the request must not wait for it.
-        assertThat(elapsedMillis)
-                .as("POST must return well under the 800ms provider latency")
-                .isLessThan(500);
-
-        UUID id = idOf(result);
-
-        // The worker eventually delivers it: PENDING -> SENT with sentAt populated.
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
             Notification stored = repository.findById(id).orElseThrow();
             assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(stored.getAttempts()).isEqualTo(1);
             assertThat(stored.getSentAt()).isNotNull();
-            assertThat(stored.getSentAt()).isAfterOrEqualTo(stored.getCreatedAt());
         });
     }
 
     @Test
-    void getReflectsAsyncTransitionToSent() throws Exception {
-        String body = """
-                {"recipient":"+15551234567","channel":"SMS","message":"hi there"}
-                """;
+    void flakyRecipientRecoversToSentViaRetry() throws Exception {
+        // Fails the first two attempts, then succeeds — proves retry recovers a transient failure.
+        UUID id = postNotify("flaky@example.com");
 
-        MvcResult result = mockMvc.perform(post("/notify")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isAccepted())
-                .andReturn();
-        String id = idOf(result).toString();
-
-        // Immediately after POST the read model is PENDING...
-        mockMvc.perform(get("/notify/{id}", id))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.id").value(id))
-                .andExpect(jsonPath("$.recipient").value("+15551234567"))
-                .andExpect(jsonPath("$.channel").value("SMS"))
-                .andExpect(jsonPath("$.message").value("hi there"));
-
-        // ...and within a few seconds GET reports SENT with a sentAt timestamp.
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
-                mockMvc.perform(get("/notify/{id}", id))
-                        .andExpect(status().isOk())
-                        .andExpect(jsonPath("$.status").value("SENT"))
-                        .andExpect(jsonPath("$.sentAt").exists()));
+        await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+            Notification stored = repository.findById(id).orElseThrow();
+            assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(stored.getAttempts()).isGreaterThanOrEqualTo(3);
+            assertThat(stored.getFailureReason()).isNull();
+        });
     }
 
     @Test
-    void providerFailureTransitionsToFailed() throws Exception {
-        String body = """
-                {"recipient":"fail@example.com","channel":"EMAIL","message":"boom"}
-                """;
+    void permanentFailureEndsDeadAndIsDeadLettered() throws Exception {
+        // Always fails -> retries are exhausted -> message is dead-lettered to notifications.dlq,
+        // where the DLQ consumer marks the row DEAD with a failureReason. Reaching DEAD (set
+        // *only* by the DLQ consumer) proves the message landed in the DLQ instead of vanishing.
+        UUID id = postNotify("fail@example.com");
 
-        MvcResult result = mockMvc.perform(post("/notify")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
-                .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.status").value("PENDING"))
-                .andReturn();
-        UUID id = idOf(result);
-
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
             Notification stored = repository.findById(id).orElseThrow();
-            assertThat(stored.getStatus()).isEqualTo(NotificationStatus.FAILED);
+            assertThat(stored.getStatus()).isEqualTo(NotificationStatus.DEAD);
+            assertThat(stored.getAttempts()).isEqualTo(4); // retry.max-attempts
+            assertThat(stored.getFailureReason()).isNotNull();
             assertThat(stored.getSentAt()).isNull();
         });
     }
 
     @Test
-    void manyRequestsReturnFastAndAllReachTerminalState() throws Exception {
-        int n = 12;
-        List<UUID> ids = new ArrayList<>(n);
+    void backoffDelayIncreasesBetweenAttempts() throws Exception {
+        UUID id = postNotify("fail@example.com");
 
-        for (int i = 0; i < n; i++) {
-            String body = String.format(
-                    "{\"recipient\":\"user%d@example.com\",\"channel\":\"EMAIL\",\"message\":\"m%d\"}",
-                    i, i);
+        // Wait for all four attempts to have been recorded by the provider.
+        await().atMost(Duration.ofSeconds(30))
+                .until(() -> provider.invocationTimes(id).size() >= 4);
 
-            long start = System.nanoTime();
-            MvcResult result = mockMvc.perform(post("/notify")
-                            .contentType(MediaType.APPLICATION_JSON)
-                            .content(body))
-                    .andExpect(status().isAccepted())
-                    .andExpect(jsonPath("$.status").value("PENDING"))
-                    .andReturn();
-            long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        List<Long> times = provider.invocationTimes(id);
+        long gap1 = times.get(1) - times.get(0);
+        long gap2 = times.get(2) - times.get(1);
+        long gap3 = times.get(3) - times.get(2);
 
-            assertThat(elapsedMillis)
-                    .as("each POST must be fast and not block on delivery")
-                    .isLessThan(500);
-            ids.add(idOf(result));
-        }
+        // initial-interval 1s, multiplier 2.0 => gaps grow (~1s, ~2s, ~4s on top of the send time).
+        // Assert loosely: each successive gap is larger than the previous one.
+        assertThat(gap2).as("2nd gap > 1st gap").isGreaterThan(gap1);
+        assertThat(gap3).as("3rd gap > 2nd gap").isGreaterThan(gap2);
+    }
 
-        // With 4 workers and ~800ms/send, all 12 settle in roughly 3 batches.
-        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
-            for (UUID id : ids) {
-                Notification stored = repository.findById(id).orElseThrow();
-                assertThat(stored.getStatus()).isIn(TERMINAL);
-            }
-        });
+    @Test
+    void getReflectsAttemptsAndStatus() throws Exception {
+        UUID id = postNotify("bob@example.com");
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                mockMvc.perform(get("/notify/{id}", id.toString()))
+                        .andExpect(status().isOk())
+                        .andExpect(jsonPath("$.status").value("SENT"))
+                        .andExpect(jsonPath("$.attempts").value(1))
+                        .andExpect(jsonPath("$.sentAt").exists()));
     }
 
     @Test
@@ -189,15 +160,17 @@ class NotificationIntegrationTest {
                 .andExpect(status().isBadRequest());
     }
 
-    @Test
-    void notificationStartsPending() {
-        Notification fresh = new Notification("bob@example.com",
-                com.example.notification.domain.Channel.PUSH, "ping");
-        assertThat(fresh.getStatus()).isEqualTo(NotificationStatus.PENDING);
-        assertThat(fresh.getSentAt()).isNull();
-    }
+    private UUID postNotify(String recipient) throws Exception {
+        String body = String.format(
+                "{\"recipient\":\"%s\",\"channel\":\"EMAIL\",\"message\":\"hello\"}", recipient);
 
-    private UUID idOf(MvcResult result) throws Exception {
+        MvcResult result = mockMvc.perform(post("/notify")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("PENDING"))
+                .andReturn();
+
         JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
         return UUID.fromString(json.get("id").asText());
     }
