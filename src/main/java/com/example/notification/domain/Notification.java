@@ -27,6 +27,14 @@ public class Notification {
     @Column(nullable = false)
     private String message;
 
+    /**
+     * Caller-supplied idempotency key (from the {@code Idempotency-Key} header).
+     * Nullable, but UNIQUE: at most one row may exist per key. Postgres allows
+     * multiple NULLs, so key-less notifications never collide.
+     */
+    @Column(name = "idempotency_key", unique = true)
+    private String idempotencyKey;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private NotificationStatus status;
@@ -113,5 +121,13 @@ public class Notification {
 
     public String getFailureReason() {
         return failureReason;
+    }
+
+    public String getIdempotencyKey() {
+        return idempotencyKey;
+    }
+
+    public void setIdempotencyKey(String idempotencyKey) {
+        this.idempotencyKey = idempotencyKey;
     }
 }
