@@ -1,15 +1,21 @@
-# Notification Service (v4)
+# Notification Service (v5)
 
 An **asynchronous** notification service backed by **RabbitMQ**, with **Postgres**
 as the source of truth. `POST /notify` saves the notification as `PENDING`,
 publishes its id to a durable queue, and returns `202 Accepted` immediately. A
-pool of `@RabbitListener` consumers drains the queue and performs delivery.
+pool of `@RabbitListener` consumers drains the queue and performs delivery, with
+**retries + backoff** and a **dead-letter queue** for permanent failures (v4).
 
-v4 adds **retries with backoff** and a **dead-letter queue**: a transient provider
-failure is retried a few times with increasing delay, and a message that still
-fails after all attempts is **dead-lettered** (never silently dropped) and its
-`Notification` row is marked `DEAD`. There is still no Redis, auth, rate limiting,
-or caching yet.
+v5 adds **idempotency** to guarantee an **at-most-once send**, defending against
+two independent duplicate sources:
+
+- **Caller-level** — a duplicate `POST /notify` (e.g. a client retry) carrying the
+  same `Idempotency-Key` header reuses the original notification instead of creating
+  a second one.
+- **Processing-level** — a RabbitMQ **redelivery** of an already-processed message
+  is skipped, so the provider is called at most once per notification.
+
+There is still no Redis, auth, rate limiting, or caching yet.
 
 ## Stack
 
@@ -21,8 +27,8 @@ or caching yet.
 ## Domain
 
 A `Notification` has: `id` (UUID), `recipient`, `channel` (`EMAIL`/`SMS`/`PUSH`),
-`message`, `status`, `attempts` (int), a nullable `failureReason`, `createdAt`,
-and a nullable `sentAt`.
+`message`, `status`, `attempts` (int), a nullable `failureReason`, a nullable and
+**UNIQUE** `idempotencyKey`, `createdAt`, and a nullable `sentAt`.
 
 `status` is one of:
 
@@ -110,6 +116,59 @@ attempt fails, Spring's default recoverer throws `AmqpRejectAndDontRequeueExcept
 the message is rejected without requeue, and the queue's dead-letter exchange
 routes it to `notifications.dlq`.
 
+## Idempotency
+
+v5 guarantees an **at-most-once send** by defending against two independent
+duplicate sources.
+
+### Caller-level: the `Idempotency-Key` header
+
+Clients retry POSTs (timeouts, network blips, at-least-once upstreams). To make a
+retry safe, send a stable **`Idempotency-Key`** header — typically derived from the
+business event (e.g. `order-4711-receipt`):
+
+- **Header present, key unseen** → create the row (storing the key), publish, return
+  `202 Accepted`.
+- **Header present, key seen** → return the **existing** `{ id, status }` with
+  `200 OK`. No second row, no second publish.
+- **Header absent** → always create (unchanged v4 behaviour), `202 Accepted`.
+
+**Why a UNIQUE constraint, not an app-level check.** A naive
+`findByKey()`-then-`insert` has a time-of-check/time-of-use (TOCTOU) gap: two
+identical requests can both find "nothing" and both insert. The race-safe design
+puts a **`UNIQUE` constraint on `idempotency_key`** and lets the database be the
+single arbiter:
+
+```
+request A ─┐                       request B ─┐
+           ▼                                  ▼
+   findByKey() → empty               findByKey() → empty
+           ▼                                  ▼
+   INSERT (key) ── commits ──► wins   INSERT (key) ──► UNIQUE violation
+                                              ▼
+                                    catch DataIntegrityViolation,
+                                    re-fetch by key → return A's row
+```
+
+The pre-check is just a fast path; **correctness comes from the constraint**. On
+violation the loser catches `DataIntegrityViolationException`, re-fetches the
+winner's row, and returns it — so concurrent duplicates collapse to exactly one
+row. (`saveAndFlush` forces the INSERT immediately so the violation surfaces inside
+the `try`, not later at commit.)
+
+### Processing-level: redelivery-safe consumer
+
+RabbitMQ is at-least-once: a message can be redelivered (consumer crash before ack,
+connection drop, etc.). Before calling the provider, the consumer checks the row's
+status:
+
+- status `PENDING` → deliver (and on success mark `SENT`).
+- status `SENT` or `DEAD` → **skip the provider call**, log
+  `skipping already-processed {id}`, and ack.
+
+So even if the same message is processed twice, the slow `provider.send()` runs at
+most once. Postgres remains the source of truth for "has this already been sent".
+
 ## 1. Start Postgres + RabbitMQ
 
 ```bash
@@ -147,10 +206,20 @@ Body: `{ recipient, channel, message }`. Saves as `PENDING`, publishes to
 `notifications.send`, and returns `202 Accepted` with `{ id, status: "PENDING" }`
 **immediately**. Blank fields or an invalid channel return `400`.
 
+Optionally send an **`Idempotency-Key`** header (see [Idempotency](#idempotency)).
+A repeated request with the same key returns `200 OK` with the original
+`{ id, status }` instead of creating a second notification.
+
 ```bash
 # normal — succeeds on the first attempt
 curl -i -X POST http://localhost:8080/notify \
   -H 'Content-Type: application/json' \
+  -d '{"recipient":"alice@example.com","channel":"EMAIL","message":"Hello!"}'
+
+# idempotent — run this twice: first returns 202 (new), second returns 200 (same id)
+curl -i -X POST http://localhost:8080/notify \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-4711-receipt' \
   -d '{"recipient":"alice@example.com","channel":"EMAIL","message":"Hello!"}'
 
 # transient failure — fails twice then recovers to SENT
@@ -239,6 +308,11 @@ then replay in bulk via the Shovel plugin or a small admin endpoint.
   dead-lettered (only the DLQ consumer sets `DEAD`, so reaching it proves the
   message landed in `notifications.dlq`); the backoff gap between attempts
   increases; and the unknown-id (`404`) / validation (`400`) paths still hold.
+  Idempotency: two POSTs with the same `Idempotency-Key` produce one row, the same
+  id, and a single provider call (second response is `200`); different keys produce
+  two rows; **8 concurrent** duplicate POSTs collapse to exactly one row (the
+  UNIQUE-constraint race); and invoking the consumer twice for an already-`SENT`
+  notification does not call the provider again.
 - `SimulatedProviderTest` — unit test for the stubbed provider.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the
