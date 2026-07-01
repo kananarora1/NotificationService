@@ -35,6 +35,10 @@ public class Notification {
     @Column(name = "idempotency_key", unique = true)
     private String idempotencyKey;
 
+    /** The tenant (resolved from the API key) that created this notification. */
+    @Column(name = "tenant_id")
+    private UUID tenantId;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private NotificationStatus status;
@@ -129,5 +133,13 @@ public class Notification {
 
     public void setIdempotencyKey(String idempotencyKey) {
         this.idempotencyKey = idempotencyKey;
+    }
+
+    public UUID getTenantId() {
+        return tenantId;
+    }
+
+    public void setTenantId(UUID tenantId) {
+        this.tenantId = tenantId;
     }
 }

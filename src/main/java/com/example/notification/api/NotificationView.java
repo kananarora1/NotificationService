@@ -12,6 +12,7 @@ import java.util.UUID;
  */
 public record NotificationView(
         UUID id,
+        UUID tenantId,
         String recipient,
         Channel channel,
         String message,
@@ -25,6 +26,7 @@ public record NotificationView(
     public static NotificationView from(Notification n) {
         return new NotificationView(
                 n.getId(),
+                n.getTenantId(),
                 n.getRecipient(),
                 n.getChannel(),
                 n.getMessage(),
