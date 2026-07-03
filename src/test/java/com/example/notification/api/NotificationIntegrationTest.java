@@ -6,16 +6,25 @@ import com.example.notification.domain.NotificationStatus;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.repository.NotificationRepository;
 import com.example.notification.service.NotificationService;
+import com.example.notification.support.MutableClock;
+import com.example.notification.web.ApiKeyAuthInterceptor;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.ResultMatcher;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.RabbitMQContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -23,6 +32,8 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -44,6 +55,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Testcontainers
 class NotificationIntegrationTest {
 
+    // Seeded tenants (see TenantSeeder): acme/60, globex/10, initech/5 per minute.
+    private static final String ACME_KEY = "key-acme";
+    private static final String GLOBEX_KEY = "key-globex";   // limit 10/min
+    private static final String INITECH_KEY = "key-initech"; // limit 5/min
+
     @Container
     @ServiceConnection
     static PostgreSQLContainer<?> postgres =
@@ -53,6 +69,16 @@ class NotificationIntegrationTest {
     @ServiceConnection
     static RabbitMQContainer rabbitmq =
             new RabbitMQContainer(DockerImageName.parse("rabbitmq:3.13-management"));
+
+    /** A controllable clock so the rate limiter's refill is deterministic and fast. */
+    @TestConfiguration
+    static class ClockConfig {
+        @Bean
+        @Primary
+        MutableClock testClock() {
+            return new MutableClock(Instant.parse("2026-07-01T00:00:00Z"), ZoneOffset.UTC);
+        }
+    }
 
     @Autowired
     private MockMvc mockMvc;
@@ -67,7 +93,19 @@ class NotificationIntegrationTest {
     private NotificationService service;
 
     @Autowired
+    private MutableClock clock;
+
+    @Autowired
     private ObjectMapper objectMapper;
+
+    @BeforeEach
+    void refillAllBuckets() {
+        // Jump well past a minute so every tenant's bucket tops up to capacity before
+        // each test — keeps rate-limit accounting isolated between tests.
+        clock.advance(Duration.ofMinutes(2));
+    }
+
+    // ---- v4/v5 behaviour (now requires a valid API key) ----
 
     @Test
     void normalRecipientSucceedsOnFirstAttempt() throws Exception {
@@ -83,7 +121,6 @@ class NotificationIntegrationTest {
 
     @Test
     void flakyRecipientRecoversToSentViaRetry() throws Exception {
-        // Fails the first two attempts, then succeeds — proves retry recovers a transient failure.
         UUID id = postNotify("flaky@example.com");
 
         await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
@@ -96,9 +133,6 @@ class NotificationIntegrationTest {
 
     @Test
     void permanentFailureEndsDeadAndIsDeadLettered() throws Exception {
-        // Always fails -> retries are exhausted -> message is dead-lettered to notifications.dlq,
-        // where the DLQ consumer marks the row DEAD with a failureReason. Reaching DEAD (set
-        // *only* by the DLQ consumer) proves the message landed in the DLQ instead of vanishing.
         UUID id = postNotify("fail@example.com");
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
@@ -114,7 +148,6 @@ class NotificationIntegrationTest {
     void backoffDelayIncreasesBetweenAttempts() throws Exception {
         UUID id = postNotify("fail@example.com");
 
-        // Wait for all four attempts to have been recorded by the provider.
         await().atMost(Duration.ofSeconds(30))
                 .until(() -> provider.invocationTimes(id).size() >= 4);
 
@@ -123,8 +156,6 @@ class NotificationIntegrationTest {
         long gap2 = times.get(2) - times.get(1);
         long gap3 = times.get(3) - times.get(2);
 
-        // initial-interval 1s, multiplier 2.0 => gaps grow (~1s, ~2s, ~4s on top of the send time).
-        // Assert loosely: each successive gap is larger than the previous one.
         assertThat(gap2).as("2nd gap > 1st gap").isGreaterThan(gap1);
         assertThat(gap3).as("3rd gap > 2nd gap").isGreaterThan(gap2);
     }
@@ -149,45 +180,39 @@ class NotificationIntegrationTest {
 
     @Test
     void blankFieldReturns400() throws Exception {
-        String body = """
-                {"recipient":"","channel":"EMAIL","message":"hello"}
-                """;
-
         mockMvc.perform(post("/notify")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
+                        .content("""
+                                {"recipient":"","channel":"EMAIL","message":"hello"}
+                                """))
                 .andExpect(status().isBadRequest());
     }
 
     @Test
     void invalidChannelReturns400() throws Exception {
-        String body = """
-                {"recipient":"alice@example.com","channel":"CARRIER_PIGEON","message":"hello"}
-                """;
-
         mockMvc.perform(post("/notify")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(body))
+                        .content("""
+                                {"recipient":"alice@example.com","channel":"CARRIER_PIGEON","message":"hello"}
+                                """))
                 .andExpect(status().isBadRequest());
     }
 
-    // ---- v5: caller-level idempotency (Part A) ----
+    // ---- v5: caller-level idempotency ----
 
     @Test
     void sameIdempotencyKeyDedupesToOneRowAndSendsOnce() throws Exception {
         String key = "key-" + UUID.randomUUID();
 
-        // First POST creates the row -> 202 Accepted.
         UUID first = postWithKey("idem-a@example.com", key, status().isAccepted());
-        // Second POST with the same key returns the existing row -> 200 OK, same id.
         UUID second = postWithKey("idem-a@example.com", key, status().isOk());
 
         assertThat(second).isEqualTo(first);
         assertThat(repository.findByIdempotencyKey(key)).get()
                 .extracting(Notification::getId).isEqualTo(first);
 
-        // The notification is delivered, and the provider is invoked at most once
-        // (the duplicate POST never published a second message).
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(repository.findById(first).orElseThrow().getStatus())
                         .isEqualTo(NotificationStatus.SENT));
@@ -221,11 +246,8 @@ class NotificationIntegrationTest {
                     ready.countDown();
                     try {
                         go.await();
-                        // Either 202 (the winner) or 200 (the rest) — both carry the same id.
-                        MvcResult r = mockMvc.perform(post("/notify")
-                                        .header("Idempotency-Key", key)
-                                        .contentType(MediaType.APPLICATION_JSON)
-                                        .content(bodyFor(recipient)))
+                        MvcResult r = mockMvc.perform(notifyPost(recipient, ACME_KEY)
+                                        .header("Idempotency-Key", key))
                                 .andReturn();
                         ids.add(idFrom(r));
                     } catch (Exception e) {
@@ -234,47 +256,131 @@ class NotificationIntegrationTest {
                 });
             }
             ready.await(5, TimeUnit.SECONDS);
-            go.countDown(); // release all threads at once to maximise the race
+            go.countDown();
             pool.shutdown();
             assertThat(pool.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
         } finally {
             pool.shutdownNow();
         }
 
-        // All concurrent requests resolved to the same single notification...
         assertThat(ids).hasSize(1);
-        // ...and the UNIQUE constraint ensured exactly one row was persisted.
         long rows = repository.findAll().stream()
                 .filter(n -> recipient.equals(n.getRecipient()))
                 .count();
         assertThat(rows).isEqualTo(1);
     }
 
-    // ---- v5: processing-level idempotency (Part B) ----
+    // ---- v5: processing-level idempotency ----
 
     @Test
     void processingIdempotencySkipsAlreadySentOnRedelivery() {
-        // Persist a PENDING row directly (not published) so only our manual calls process it.
         Notification n = new Notification("proc@example.com", Channel.EMAIL, "once");
         repository.save(n);
         UUID id = n.getId();
 
-        // First invocation delivers (provider called once) and marks SENT.
         service.attemptDelivery(id);
-        // Second invocation simulates a RabbitMQ redelivery: status is SENT -> skip.
-        service.attemptDelivery(id);
+        service.attemptDelivery(id); // redelivery: status SENT -> skip
 
         assertThat(provider.invocationTimes(id)).hasSize(1);
         assertThat(repository.findById(id).orElseThrow().getStatus())
                 .isEqualTo(NotificationStatus.SENT);
     }
 
-    private UUID postWithKey(String recipient, String key, org.springframework.test.web.servlet.ResultMatcher expectedStatus)
-            throws Exception {
-        MvcResult result = mockMvc.perform(post("/notify")
-                        .header("Idempotency-Key", key)
+    // ---- v6 Stage 1: API key identity ----
+
+    @Test
+    void missingApiKeyReturns401() throws Exception {
+        mockMvc.perform(post("/notify")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(bodyFor(recipient)))
+                        .content(bodyFor("auth@example.com")))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void unknownApiKeyReturns401() throws Exception {
+        mockMvc.perform(post("/notify")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, "key-does-not-exist")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(bodyFor("auth@example.com")))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void validApiKeyIsAcceptedAndStoresTenant() throws Exception {
+        UUID id = postNotify("auth-ok@example.com");
+        assertThat(repository.findById(id).orElseThrow().getTenantId()).isNotNull();
+    }
+
+    // ---- v6 Stage 2: per-tenant rate limiting ----
+
+    @Test
+    void rateLimitReturns429WhenBudgetExhaustedAndIsolatesTenants() throws Exception {
+        // globex allows 10/min. The test clock is frozen here, so 13 rapid requests
+        // see a full bucket drained to empty: 10 succeed, the rest are limited.
+        int accepted = 0;
+        int limited = 0;
+        String retryAfter = null;
+
+        for (int i = 0; i < 13; i++) {
+            MvcResult r = mockMvc.perform(notifyPost("rl@example.com", GLOBEX_KEY)).andReturn();
+            int s = r.getResponse().getStatus();
+            if (s == 202) {
+                accepted++;
+            } else if (s == 429) {
+                limited++;
+                retryAfter = r.getResponse().getHeader(HttpHeaders.RETRY_AFTER);
+            }
+        }
+
+        assertThat(accepted).isEqualTo(10);
+        assertThat(limited).isEqualTo(3);
+        assertThat(retryAfter).isNotNull();
+        assertThat(Long.parseLong(retryAfter)).isPositive();
+
+        // Isolation: a different tenant's budget is untouched.
+        mockMvc.perform(notifyPost("rl-other@example.com", ACME_KEY))
+                .andExpect(status().isAccepted());
+    }
+
+    @Test
+    void rateLimitBucketRefillsOverTime() throws Exception {
+        // initech allows 5/min => one token every 12s.
+        for (int i = 0; i < 5; i++) {
+            mockMvc.perform(notifyPost("refill@example.com", INITECH_KEY))
+                    .andExpect(status().isAccepted());
+        }
+        // Bucket now empty -> 429.
+        mockMvc.perform(notifyPost("refill@example.com", INITECH_KEY))
+                .andExpect(status().isTooManyRequests());
+
+        // Advance past one refill interval; a token becomes available.
+        clock.advance(Duration.ofSeconds(13));
+
+        mockMvc.perform(notifyPost("refill@example.com", INITECH_KEY))
+                .andExpect(status().isAccepted());
+    }
+
+    // ---- helpers ----
+
+    private MockHttpServletRequestBuilder notifyPost(String recipient, String apiKey) {
+        return post("/notify")
+                .header(ApiKeyAuthInterceptor.API_KEY_HEADER, apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(bodyFor(recipient));
+    }
+
+    private UUID postNotify(String recipient) throws Exception {
+        MvcResult result = mockMvc.perform(notifyPost(recipient, ACME_KEY))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("PENDING"))
+                .andReturn();
+        return idFrom(result);
+    }
+
+    private UUID postWithKey(String recipient, String idempotencyKey, ResultMatcher expectedStatus)
+            throws Exception {
+        MvcResult result = mockMvc.perform(notifyPost(recipient, ACME_KEY)
+                        .header("Idempotency-Key", idempotencyKey))
                 .andExpect(expectedStatus)
                 .andReturn();
         return idFrom(result);
@@ -288,15 +394,5 @@ class NotificationIntegrationTest {
     private UUID idFrom(MvcResult result) throws Exception {
         JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
         return UUID.fromString(json.get("id").asText());
-    }
-
-    private UUID postNotify(String recipient) throws Exception {
-        MvcResult result = mockMvc.perform(post("/notify")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(bodyFor(recipient)))
-                .andExpect(status().isAccepted())
-                .andExpect(jsonPath("$.status").value("PENDING"))
-                .andReturn();
-        return idFrom(result);
     }
 }

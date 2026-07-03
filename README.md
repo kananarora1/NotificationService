@@ -1,34 +1,40 @@
-# Notification Service (v5)
+# Notification Service (v6)
 
 An **asynchronous** notification service backed by **RabbitMQ**, with **Postgres**
 as the source of truth. `POST /notify` saves the notification as `PENDING`,
 publishes its id to a durable queue, and returns `202 Accepted` immediately. A
 pool of `@RabbitListener` consumers drains the queue and performs delivery, with
-**retries + backoff** and a **dead-letter queue** for permanent failures (v4).
+**retries + backoff** and a **dead-letter queue** for permanent failures (v4), and
+**idempotency** for an at-most-once send (v5).
 
-v5 adds **idempotency** to guarantee an **at-most-once send**, defending against
-two independent duplicate sources:
+v6 introduces **tenant identity and rate limiting**, in two stages:
 
-- **Caller-level** — a duplicate `POST /notify` (e.g. a client retry) carrying the
-  same `Idempotency-Key` header reuses the original notification instead of creating
-  a second one.
-- **Processing-level** — a RabbitMQ **redelivery** of an already-processed message
-  is skipped, so the provider is called at most once per notification.
+- **Stage 1 — API keys.** Every `POST /notify` must carry an `X-API-Key` header
+  that resolves to a **tenant**; unknown/missing keys are `401`. Each notification
+  records the tenant that created it.
+- **Stage 2 — per-tenant rate limiting.** Each tenant has a `rateLimitPerMinute`
+  budget enforced by an in-process **token bucket**; over-budget requests get
+  `429 Too Many Requests` with a `Retry-After` header.
 
-There is still no Redis, auth, rate limiting, or caching yet.
+> ⚠️ The rate limiter is **deliberately in-memory / per-instance** — it over-admits
+> when you run multiple instances. See [Known limitation](#known-limitation-in-memory-rate-limiter-is-per-instance).
+
+There is still no Redis, caching, or auth beyond the API key yet.
 
 ## Stack
 
 - Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP)
-- PostgreSQL — source of truth
+- PostgreSQL — source of truth (notifications + tenants)
 - RabbitMQ — message broker (with retries + dead-letter queue)
 - Maven
 
 ## Domain
 
-A `Notification` has: `id` (UUID), `recipient`, `channel` (`EMAIL`/`SMS`/`PUSH`),
-`message`, `status`, `attempts` (int), a nullable `failureReason`, a nullable and
-**UNIQUE** `idempotencyKey`, `createdAt`, and a nullable `sentAt`.
+A `Notification` has: `id` (UUID), `tenantId` (the API-key tenant that created it),
+`recipient`, `channel` (`EMAIL`/`SMS`/`PUSH`), `message`, `status`, `attempts` (int),
+a nullable `failureReason`, a nullable and **UNIQUE** `idempotencyKey`, `createdAt`,
+and a nullable `sentAt`. A `Tenant` has: `id`, `name`, unique `apiKey`, and
+`rateLimitPerMinute`.
 
 `status` is one of:
 
@@ -169,6 +175,64 @@ status:
 So even if the same message is processed twice, the slow `provider.send()` runs at
 most once. Postgres remains the source of truth for "has this already been sent".
 
+## Tenants, API keys & rate limiting (v6)
+
+### Identity: the `X-API-Key` header
+
+`POST /notify` requires an **`X-API-Key`** header. The key is resolved to a
+**tenant** (table `tenants`: `id`, `name`, unique `apiKey`, `rateLimitPerMinute`).
+A missing or unknown key returns **`401 Unauthorized`** before the controller runs
+(enforced by a `HandlerInterceptor`). The resolving tenant's id is stored on every
+notification it creates (`tenant_id`). `GET /notify/{id}` is **not** gated.
+
+Tenants are seeded at startup (idempotently, safe across instances):
+
+| tenant   | apiKey         | rateLimitPerMinute |
+|----------|----------------|--------------------|
+| acme     | `key-acme`     | 60                 |
+| globex   | `key-globex`   | 10                 |
+| initech  | `key-initech`  | 5                  |
+
+### Rate limiting: per-tenant token bucket
+
+After identity, a second interceptor enforces the tenant's per-minute budget with a
+**token bucket** (capacity = `rateLimitPerMinute`, refilling continuously at
+`limit / 60s`). Each accepted `POST` consumes one token:
+
+- token available → proceed as normal (`202`, or `200` for an idempotent duplicate).
+- bucket empty → **`429 Too Many Requests`** with a **`Retry-After`** header (seconds
+  until the next token).
+
+Buckets are isolated per tenant: exhausting `globex` does not affect `acme`.
+
+```
+POST /notify ─► [X-API-Key?] ──no/unknown──► 401
+                     │ tenant
+                     ▼
+              [token available?] ──no──► 429 + Retry-After
+                     │ yes (consume 1)
+                     ▼
+              create / dedupe ─► 202 or 200
+```
+
+## Known limitation: in-memory rate limiter is per-instance
+
+The limiter state is a `ConcurrentHashMap<tenantId, TokenBucket>` **in each JVM** —
+there is no shared store. So the limit is enforced **per instance**: running *N*
+instances behind a load balancer admits up to *N × rateLimitPerMinute* requests for
+a tenant, because each instance has its own independent bucket. This is intentional
+for v6 — it makes the failure mode visible. Run two instances against the same
+Postgres + RabbitMQ to see it:
+
+```bash
+./mvnw spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
+./mvnw spring-boot:run -Dspring-boot.run.arguments=--server.port=8081
+# globex (limit 10) can now get ~20 requests/min through — 10 per instance.
+```
+
+**To be fixed in v7** with a shared/distributed limiter (e.g. a centralized token
+store) so the budget is global across instances.
+
 ## 1. Start Postgres + RabbitMQ
 
 ```bash
@@ -202,32 +266,51 @@ are declared on startup.
 
 ### POST /notify
 
-Body: `{ recipient, channel, message }`. Saves as `PENDING`, publishes to
-`notifications.send`, and returns `202 Accepted` with `{ id, status: "PENDING" }`
-**immediately**. Blank fields or an invalid channel return `400`.
+Body: `{ recipient, channel, message }`. **Requires** an `X-API-Key` header
+(see [Tenants & rate limiting](#tenants-api-keys--rate-limiting-v6)). Saves as
+`PENDING`, publishes to `notifications.send`, and returns `202 Accepted` with
+`{ id, status: "PENDING" }` **immediately**.
 
-Optionally send an **`Idempotency-Key`** header (see [Idempotency](#idempotency)).
-A repeated request with the same key returns `200 OK` with the original
-`{ id, status }` instead of creating a second notification.
+- Missing / unknown `X-API-Key` → `401 Unauthorized`.
+- Over the tenant's per-minute budget → `429 Too Many Requests` + `Retry-After`.
+- Blank fields or an invalid channel → `400`.
+- Optional **`Idempotency-Key`** header (see [Idempotency](#idempotency)): a repeat
+  with the same key returns `200 OK` with the original `{ id, status }`.
 
 ```bash
 # normal — succeeds on the first attempt
 curl -i -X POST http://localhost:8080/notify \
   -H 'Content-Type: application/json' \
+  -H 'X-API-Key: key-acme' \
   -d '{"recipient":"alice@example.com","channel":"EMAIL","message":"Hello!"}'
 
-# idempotent — run this twice: first returns 202 (new), second returns 200 (same id)
+# missing key -> 401
 curl -i -X POST http://localhost:8080/notify \
   -H 'Content-Type: application/json' \
+  -d '{"recipient":"alice@example.com","channel":"EMAIL","message":"no key"}'
+
+# hammer globex (limit 10/min) to see 429 + Retry-After
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "%{http_code} " -X POST http://localhost:8080/notify \
+    -H 'Content-Type: application/json' -H 'X-API-Key: key-globex' \
+    -d '{"recipient":"a@example.com","channel":"EMAIL","message":"burst"}'
+done; echo   # => 202 ×10 then 429 ×2
+
+# idempotent — run twice: first 202 (new), second 200 (same id)
+curl -i -X POST http://localhost:8080/notify \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: key-acme' \
   -H 'Idempotency-Key: order-4711-receipt' \
   -d '{"recipient":"alice@example.com","channel":"EMAIL","message":"Hello!"}'
 
 # transient failure — fails twice then recovers to SENT
 curl -s -X POST http://localhost:8080/notify -H 'Content-Type: application/json' \
+  -H 'X-API-Key: key-acme' \
   -d '{"recipient":"flaky@example.com","channel":"EMAIL","message":"retry me"}'
 
 # permanent failure — ends DEAD and lands in notifications.dlq
 curl -s -X POST http://localhost:8080/notify -H 'Content-Type: application/json' \
+  -H 'X-API-Key: key-acme' \
   -d '{"recipient":"fail@example.com","channel":"EMAIL","message":"doomed"}'
 ```
 
@@ -313,6 +396,10 @@ then replay in bulk via the Shovel plugin or a small admin endpoint.
   two rows; **8 concurrent** duplicate POSTs collapse to exactly one row (the
   UNIQUE-constraint race); and invoking the consumer twice for an already-`SENT`
   notification does not call the provider again.
+  Auth + rate limiting (v6): missing/unknown `X-API-Key` → `401`, valid key proceeds
+  and stores `tenant_id`; exceeding a tenant's per-minute budget → `429` (with a
+  positive `Retry-After`) while a different tenant is unaffected (isolation); and the
+  bucket refills over time — driven by a controllable `Clock` so the test is fast.
 - `SimulatedProviderTest` — unit test for the stubbed provider.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the
