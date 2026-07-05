@@ -26,6 +26,16 @@ services:
     volumes:
       - notification-rabbitmq:/var/lib/rabbitmq
 
+  redis:
+    image: redis:7-alpine
+    container_name: notification-redis
+    # Shared store for the distributed rate limiter (v7).
+    ports:
+      - "6379:6379"
+    volumes:
+      - notification-redis:/data
+
 volumes:
   notification-pgdata:
   notification-rabbitmq:
+  notification-redis:
