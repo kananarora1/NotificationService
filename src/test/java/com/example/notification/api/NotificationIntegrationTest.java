@@ -4,9 +4,12 @@ import com.example.notification.domain.Channel;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 import com.example.notification.provider.SimulatedProvider;
+import com.example.notification.ratelimit.RateLimiter;
 import com.example.notification.repository.NotificationRepository;
 import com.example.notification.service.NotificationService;
 import com.example.notification.support.MutableClock;
+import com.example.notification.tenant.Tenant;
+import com.example.notification.tenant.TenantRepository;
 import com.example.notification.web.ApiKeyAuthInterceptor;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,12 +22,18 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultMatcher;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.RabbitMQContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -70,6 +79,16 @@ class NotificationIntegrationTest {
     static RabbitMQContainer rabbitmq =
             new RabbitMQContainer(DockerImageName.parse("rabbitmq:3.13-management"));
 
+    @Container
+    static GenericContainer<?> redis =
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
+
+    @DynamicPropertySource
+    static void redisProps(DynamicPropertyRegistry registry) {
+        registry.add("spring.data.redis.host", redis::getHost);
+        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+    }
+
     /** A controllable clock so the rate limiter's refill is deterministic and fast. */
     @TestConfiguration
     static class ClockConfig {
@@ -96,13 +115,24 @@ class NotificationIntegrationTest {
     private MutableClock clock;
 
     @Autowired
+    private TenantRepository tenantRepository;
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    @Autowired
+    private RedisScript<List> tokenBucketScript;
+
+    @Autowired
+    private RedisConnectionFactory redisConnectionFactory;
+
+    @Autowired
     private ObjectMapper objectMapper;
 
     @BeforeEach
-    void refillAllBuckets() {
-        // Jump well past a minute so every tenant's bucket tops up to capacity before
-        // each test — keeps rate-limit accounting isolated between tests.
-        clock.advance(Duration.ofMinutes(2));
+    void resetRateLimiterState() {
+        // Clear all rate-limit buckets so each test starts with fresh, full budgets.
+        redisConnectionFactory.getConnection().serverCommands().flushDb();
     }
 
     // ---- v4/v5 behaviour (now requires a valid API key) ----
@@ -358,6 +388,33 @@ class NotificationIntegrationTest {
 
         mockMvc.perform(notifyPost("refill@example.com", INITECH_KEY))
                 .andExpect(status().isAccepted());
+    }
+
+    // ---- v7: distributed correctness across instances ----
+
+    @Test
+    void limitHoldsAcrossTwoInstancesSharingOneRedis() {
+        // Two RateLimiter instances stand in for two app instances behind a load
+        // balancer, both pointed at the SAME Redis. This is exactly the scenario that
+        // over-admitted in v6 (each instance had its own in-memory bucket -> 2x limit).
+        RateLimiter instanceA = new RateLimiter(redisTemplate, tokenBucketScript, clock);
+        RateLimiter instanceB = new RateLimiter(redisTemplate, tokenBucketScript, clock);
+
+        Tenant globex = tenantRepository.findByApiKey(GLOBEX_KEY).orElseThrow();
+        int limit = globex.getRateLimitPerMinute(); // 10
+
+        int allowed = 0;
+        // Fire 2x the limit, interleaved across the two "instances".
+        for (int i = 0; i < 2 * limit; i++) {
+            RateLimiter instance = (i % 2 == 0) ? instanceA : instanceB;
+            if (instance.tryConsume(globex).allowed()) {
+                allowed++;
+            }
+        }
+
+        // Exactly the limit is admitted in total — not 2x. The shared, atomic Redis
+        // counter is the single source of truth across instances.
+        assertThat(allowed).isEqualTo(limit);
     }
 
     // ---- helpers ----

@@ -1,31 +1,24 @@
-# Notification Service (v6)
+# Notification Service (v7)
 
 An **asynchronous** notification service backed by **RabbitMQ**, with **Postgres**
 as the source of truth. `POST /notify` saves the notification as `PENDING`,
 publishes its id to a durable queue, and returns `202 Accepted` immediately. A
 pool of `@RabbitListener` consumers drains the queue and performs delivery, with
-**retries + backoff** and a **dead-letter queue** for permanent failures (v4), and
-**idempotency** for an at-most-once send (v5).
+**retries + backoff** and a **dead-letter queue** for permanent failures (v4),
+**idempotency** for an at-most-once send (v5), and **tenant identity via API keys**
+(v6).
 
-v6 introduces **tenant identity and rate limiting**, in two stages:
-
-- **Stage 1 — API keys.** Every `POST /notify` must carry an `X-API-Key` header
-  that resolves to a **tenant**; unknown/missing keys are `401`. Each notification
-  records the tenant that created it.
-- **Stage 2 — per-tenant rate limiting.** Each tenant has a `rateLimitPerMinute`
-  budget enforced by an in-process **token bucket**; over-budget requests get
-  `429 Too Many Requests` with a `Retry-After` header.
-
-> ⚠️ The rate limiter is **deliberately in-memory / per-instance** — it over-admits
-> when you run multiple instances. See [Known limitation](#known-limitation-in-memory-rate-limiter-is-per-instance).
-
-There is still no Redis, caching, or auth beyond the API key yet.
+v7 replaces v6's in-memory rate limiter with a **Redis-backed distributed rate
+limiter**, so a tenant's per-minute budget holds **across multiple app instances**.
+The check-and-decrement runs as an **atomic Lua script inside Redis**, which is what
+makes it correct under concurrency (see [Rate limiting](#rate-limiting-distributed-v7)).
 
 ## Stack
 
-- Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP)
+- Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis)
 - PostgreSQL — source of truth (notifications + tenants)
 - RabbitMQ — message broker (with retries + dead-letter queue)
+- Redis — shared store for the distributed rate limiter
 - Maven
 
 ## Domain
@@ -193,47 +186,72 @@ Tenants are seeded at startup (idempotently, safe across instances):
 | globex   | `key-globex`   | 10                 |
 | initech  | `key-initech`  | 5                  |
 
-### Rate limiting: per-tenant token bucket
+## Rate limiting: distributed (v7)
 
-After identity, a second interceptor enforces the tenant's per-minute budget with a
-**token bucket** (capacity = `rateLimitPerMinute`, refilling continuously at
-`limit / 60s`). Each accepted `POST` consumes one token:
-
-- token available → proceed as normal (`202`, or `200` for an idempotent duplicate).
-- bucket empty → **`429 Too Many Requests`** with a **`Retry-After`** header (seconds
-  until the next token).
-
-Buckets are isolated per tenant: exhausting `globex` does not affect `acme`.
+After identity, a second interceptor enforces the tenant's per-minute budget. In v7
+the budget lives in **Redis** (not per-JVM memory), so it is shared across every app
+instance.
 
 ```
 POST /notify ─► [X-API-Key?] ──no/unknown──► 401
                      │ tenant
                      ▼
-              [token available?] ──no──► 429 + Retry-After
-                     │ yes (consume 1)
+        [Redis EVAL token-bucket: allow?] ──no──► 429 + Retry-After
+                     │ yes (atomically consumed 1)
                      ▼
               create / dedupe ─► 202 or 200
 ```
 
-## Known limitation: in-memory rate limiter is per-instance
+Each accepted `POST` consumes one token; an empty bucket returns **`429 Too Many
+Requests`** with a **`Retry-After`** header (seconds until the next token). Buckets
+are isolated per tenant — exhausting `globex` does not affect `acme`.
 
-The limiter state is a `ConcurrentHashMap<tenantId, TokenBucket>` **in each JVM** —
-there is no shared store. So the limit is enforced **per instance**: running *N*
-instances behind a load balancer admits up to *N × rateLimitPerMinute* requests for
-a tenant, because each instance has its own independent bucket. This is intentional
-for v6 — it makes the failure mode visible. Run two instances against the same
-Postgres + RabbitMQ to see it:
+### Algorithm: token bucket in a Lua script
+
+A **token bucket** (capacity = `rateLimitPerMinute`, refilling continuously at
+`limit / 60s`), stored per tenant under key **`ratelimit:{tenantId}`** as a small
+Redis hash (`tokens`, `ts`). The whole decision runs as one **Lua script via `EVAL`**
+(`src/main/resources/ratelimit/token_bucket.lua`): read → refill by elapsed time →
+check → decrement → write, all atomically.
+
+Chosen over a fixed-window `INCR` counter because the token bucket **smooths bursts**
+(a fixed window admits up to *2× limit* across a window boundary — the last requests
+of one window plus the first of the next). The cost is a slightly more involved
+script; both are atomic and correct, this one just has nicer burst behaviour.
+
+### Why it must be atomic (not GET-then-SET)
+
+The correctness of a distributed limiter hinges on the read-modify-write being a
+**single atomic operation**. If Java did `GET count` → decide → `SET count`, two
+instances could both read "1 token left", both decide "allowed", and both write —
+admitting two requests against a budget of one. That is the exact **TOCTOU race**
+this feature exists to prevent (it's the same class of bug as v5's idempotency
+race, solved there by a UNIQUE constraint). Redis executes each `EVAL` script
+atomically (single-threaded command execution), so the check-and-decrement cannot
+interleave across instances.
+
+### Redis-down policy: fail-open
+
+If the Redis call throws (broker down, network partition), the limiter **fails
+open** — it logs a warning and *allows* the request. For a notification system,
+continuing to deliver is preferred over a hard outage caused by the rate limiter
+itself. This is a deliberate choice; flip `RateLimiter.FAIL_OPEN` to `false` for
+fail-closed (reject on Redis errors) if your risk tolerance differs.
+
+### It now holds across instances
+
+Run two instances against the same Postgres + RabbitMQ + Redis:
 
 ```bash
 ./mvnw spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
 ./mvnw spring-boot:run -Dspring-boot.run.arguments=--server.port=8081
-# globex (limit 10) can now get ~20 requests/min through — 10 per instance.
+# globex (limit 10) now admits 10/min TOTAL across both instances — not 10 each.
 ```
 
-**To be fixed in v7** with a shared/distributed limiter (e.g. a centralized token
-store) so the budget is global across instances.
+This is the property that failed in v6 and is pinned by the
+`limitHoldsAcrossTwoInstancesSharingOneRedis` test.
 
-## 1. Start Postgres + RabbitMQ
+## 1. Start Postgres + RabbitMQ + Redis
 
 ```bash
 docker compose up -d
@@ -246,6 +264,9 @@ This starts:
   `notifications`.
 - **RabbitMQ 3.13** with the management plugin: AMQP on `localhost:5672`, and the
   management UI on **http://localhost:15672** (login **guest / guest**).
+- **Redis 7** on `localhost:6379` — the shared store for the distributed rate
+  limiter. Inspect a bucket with
+  `docker exec notification-redis redis-cli hgetall "ratelimit:<tenantId>"`.
 
 > **Upgrading an existing broker:** v4 adds dead-letter arguments to the
 > `notifications.send` queue. RabbitMQ refuses to redeclare an existing queue with
@@ -382,29 +403,32 @@ then replay in bulk via the Shovel plugin or a small admin endpoint.
 ./mvnw test
 ```
 
-- `NotificationIntegrationTest` — `@SpringBootTest` + MockMvc, with **Postgres and
-  RabbitMQ provided by [Testcontainers](https://testcontainers.com/)** (via
-  `@ServiceConnection`) and [Awaitility](https://github.com/awaitility/awaitility)
-  for async waits. Covers: a normal recipient ends `SENT` with `attempts == 1`;
-  `flaky@example.com` recovers to `SENT` with `attempts >= 3` (retry recovers a
-  transient failure); `fail@example.com` ends `DEAD` with a `failureReason` and is
-  dead-lettered (only the DLQ consumer sets `DEAD`, so reaching it proves the
-  message landed in `notifications.dlq`); the backoff gap between attempts
-  increases; and the unknown-id (`404`) / validation (`400`) paths still hold.
+- `NotificationIntegrationTest` — `@SpringBootTest` + MockMvc, with **Postgres,
+  RabbitMQ and Redis provided by [Testcontainers](https://testcontainers.com/)** and
+  [Awaitility](https://github.com/awaitility/awaitility) for async waits. Covers: a
+  normal recipient ends `SENT` with `attempts == 1`; `flaky@example.com` recovers to
+  `SENT` with `attempts >= 3` (retry recovers a transient failure); `fail@example.com`
+  ends `DEAD` with a `failureReason` and is dead-lettered (only the DLQ consumer sets
+  `DEAD`, so reaching it proves the message landed in `notifications.dlq`); the
+  backoff gap between attempts increases; and the unknown-id (`404`) / validation
+  (`400`) paths still hold.
   Idempotency: two POSTs with the same `Idempotency-Key` produce one row, the same
   id, and a single provider call (second response is `200`); different keys produce
   two rows; **8 concurrent** duplicate POSTs collapse to exactly one row (the
   UNIQUE-constraint race); and invoking the consumer twice for an already-`SENT`
   notification does not call the provider again.
-  Auth + rate limiting (v6): missing/unknown `X-API-Key` → `401`, valid key proceeds
-  and stores `tenant_id`; exceeding a tenant's per-minute budget → `429` (with a
-  positive `Retry-After`) while a different tenant is unaffected (isolation); and the
-  bucket refills over time — driven by a controllable `Clock` so the test is fast.
+  Auth + rate limiting: missing/unknown `X-API-Key` → `401`, valid key proceeds and
+  stores `tenant_id`; exceeding a tenant's per-minute budget → `429` (with a positive
+  `Retry-After`) while a different tenant is unaffected (isolation); and the bucket
+  refills over time — driven by a controllable `Clock` so the test is fast.
+  **Distributed correctness (v7):** two `RateLimiter` instances sharing one Redis are
+  fired `2×limit` interleaved requests and admit **exactly `limit`** in total (not
+  double) — the property that failed with the v6 in-memory limiter.
 - `SimulatedProviderTest` — unit test for the stubbed provider.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the
-> Postgres and RabbitMQ containers automatically — no need to `docker compose up`
-> first). Because of the backoff, the dead-letter test waits ~10s.
+> Postgres, RabbitMQ and Redis containers automatically — no need to `docker compose
+> up` first). Because of the backoff, the dead-letter test waits ~10s.
 
 ### Note on Docker Engine 29+
 
