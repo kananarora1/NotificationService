@@ -19,3 +19,15 @@ spring:
           initial-interval: 1000
           multiplier: 2.0
           max-interval: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, prometheus
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        notifications.delivery.latency: true
+        notifications.end_to_end.latency: true
