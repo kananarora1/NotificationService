@@ -1,5 +1,6 @@
 package com.example.notification.ratelimit;
 
+import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.tenant.Tenant;
 import com.example.notification.web.ApiKeyAuthInterceptor;
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,9 +21,11 @@ import org.springframework.web.servlet.HandlerInterceptor;
 public class RateLimitInterceptor implements HandlerInterceptor {
 
     private final RateLimiter rateLimiter;
+    private final NotificationMetrics metrics;
 
-    public RateLimitInterceptor(RateLimiter rateLimiter) {
+    public RateLimitInterceptor(RateLimiter rateLimiter, NotificationMetrics metrics) {
         this.rateLimiter = rateLimiter;
+        this.metrics = metrics;
     }
 
     @Override
@@ -40,6 +43,7 @@ public class RateLimitInterceptor implements HandlerInterceptor {
 
         RateLimitDecision decision = rateLimiter.tryConsume(tenant);
         if (!decision.allowed()) {
+            metrics.rateLimitRejected(tenant.getName());
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(decision.retryAfterSeconds()));
             return false;

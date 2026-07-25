@@ -3,6 +3,7 @@ package com.example.notification.service;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 import com.example.notification.messaging.NotificationPublisher;
+import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.provider.NotificationProvider;
 import com.example.notification.repository.NotificationRepository;
 import org.slf4j.Logger;
@@ -11,6 +12,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -22,13 +24,16 @@ public class NotificationService {
     private final NotificationRepository repository;
     private final NotificationProvider provider;
     private final NotificationPublisher publisher;
+    private final NotificationMetrics metrics;
 
     public NotificationService(NotificationRepository repository,
                                NotificationProvider provider,
-                               NotificationPublisher publisher) {
+                               NotificationPublisher publisher,
+                               NotificationMetrics metrics) {
         this.repository = repository;
         this.provider = provider;
         this.publisher = publisher;
+        this.metrics = metrics;
     }
 
     /**
@@ -109,9 +114,23 @@ public class NotificationService {
         repository.save(notification);
         log.info("Delivery attempt {} for notification {}", attempt, id);
 
-        provider.send(notification); // throws on failure -> propagates for retry/dead-lettering
-        notification.markSent(Instant.now());
+        String tenant = metrics.tenantName(notification.getTenantId());
+        long startNanos = System.nanoTime();
+        try {
+            provider.send(notification); // throws on failure -> propagates for retry/dead-lettering
+        } catch (RuntimeException e) {
+            metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
+            metrics.failedAttempt(tenant);
+            throw e;
+        }
+        metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
+
+        Instant sentAt = Instant.now();
+        notification.markSent(sentAt);
         repository.save(notification);
+
+        metrics.sent(tenant, notification.getChannel().name());
+        metrics.recordEndToEndLatency(Duration.between(notification.getCreatedAt(), sentAt));
     }
 
     /**
@@ -123,6 +142,7 @@ public class NotificationService {
                 .orElseThrow(() -> new NotificationNotFoundException(id));
         notification.markDead(reason);
         repository.save(notification);
+        metrics.dead(metrics.tenantName(notification.getTenantId()));
         return notification.getAttempts();
     }
 

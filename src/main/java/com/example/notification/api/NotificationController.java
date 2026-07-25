@@ -2,6 +2,7 @@
 package com.example.notification.api;
 
 import com.example.notification.domain.Notification;
+import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.service.CreateResult;
 import com.example.notification.service.NotificationService;
 import com.example.notification.tenant.Tenant;
@@ -25,9 +26,11 @@ import java.util.UUID;
 public class NotificationController {
 
     private final NotificationService service;
+    private final NotificationMetrics metrics;
 
-    public NotificationController(NotificationService service) {
+    public NotificationController(NotificationService service, NotificationMetrics metrics) {
         this.service = service;
+        this.metrics = metrics;
     }
 
     @PostMapping
@@ -45,6 +48,9 @@ public class NotificationController {
         // Idempotency-Key matches an existing notification, the existing one is
         // returned without creating or publishing a duplicate (200).
         CreateResult result = service.create(notification, idempotencyKey);
+        if (result.created()) {
+            metrics.submitted(tenant.getName(), request.channel().name());
+        }
         HttpStatus status = result.created() ? HttpStatus.ACCEPTED : HttpStatus.OK;
         return ResponseEntity.status(status).body(NotifyResponse.from(result.notification()));
     }
