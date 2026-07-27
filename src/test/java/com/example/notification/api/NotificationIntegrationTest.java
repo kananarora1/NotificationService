@@ -13,9 +13,12 @@ import com.example.notification.tenant.TenantRepository;
 import com.example.notification.web.ApiKeyAuthInterceptor;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -61,6 +64,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@AutoConfigureObservability // enable the real (Prometheus) meter registry in tests, not just SimpleMeterRegistry
 @Testcontainers
 class NotificationIntegrationTest {
 
@@ -125,6 +129,9 @@ class NotificationIntegrationTest {
 
     @Autowired
     private RedisConnectionFactory redisConnectionFactory;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -417,7 +424,88 @@ class NotificationIntegrationTest {
         assertThat(allowed).isEqualTo(limit);
     }
 
+    // ---- v8: observability / metrics ----
+
+    @Test
+    void submittedAndSentMetricsIncrement() throws Exception {
+        double submittedBefore = counter("notifications.submitted", "tenant", "acme", "channel", "EMAIL");
+        double sentBefore = counter("notifications.sent", "tenant", "acme", "channel", "EMAIL");
+
+        UUID id = postNotify("metrics-normal@example.com"); // acme / EMAIL / normal recipient
+
+        // submitted is recorded synchronously on the POST.
+        assertThat(counter("notifications.submitted", "tenant", "acme", "channel", "EMAIL"))
+                .isEqualTo(submittedBefore + 1);
+
+        // sent is recorded once the consumer delivers it.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(repository.findById(id).orElseThrow().getStatus())
+                    .isEqualTo(NotificationStatus.SENT);
+            assertThat(counter("notifications.sent", "tenant", "acme", "channel", "EMAIL"))
+                    .isGreaterThanOrEqualTo(sentBefore + 1);
+        });
+    }
+
+    @Test
+    void rateLimitRejectedMetricIsTaggedByTenant() throws Exception {
+        double before = counter("ratelimit.rejected", "tenant", "globex");
+
+        // globex limit 10; 13 requests -> 3 rejected (clock frozen, Redis flushed in @BeforeEach).
+        for (int i = 0; i < 13; i++) {
+            mockMvc.perform(notifyPost("rl-metric@example.com", GLOBEX_KEY));
+        }
+
+        assertThat(counter("ratelimit.rejected", "tenant", "globex")).isEqualTo(before + 3);
+        // The counter is tenant-scoped: acme has no rejections from globex's overflow.
+        assertThat(meterRegistry.find("ratelimit.rejected").tags("tenant", "globex").counter())
+                .isNotNull();
+    }
+
+    @Test
+    void deadMetricIncrementsAndPrometheusExposesAllCustomMetrics() throws Exception {
+        double deadBefore = counter("notifications.dead", "tenant", "acme");
+
+        // Exercise every path so each custom meter has been created.
+        postNotify("obs-normal@example.com");            // submitted + sent + delivery/e2e timers
+        UUID deadId = postNotify("fail@example.com");     // -> DEAD + failed_attempt
+        for (int i = 0; i < 12; i++) {                    // -> ratelimit.rejected
+            mockMvc.perform(notifyPost("obs-rl@example.com", GLOBEX_KEY));
+        }
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(repository.findById(deadId).orElseThrow().getStatus())
+                        .isEqualTo(NotificationStatus.DEAD));
+        assertThat(counter("notifications.dead", "tenant", "acme")).isGreaterThanOrEqualTo(deadBefore + 1);
+
+        String body = mockMvc.perform(get("/actuator/prometheus"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        // Custom metrics (Prometheus naming: dots -> underscores, counters get _total).
+        assertThat(body)
+                .contains("notifications_submitted_total")
+                .contains("notifications_sent_total")
+                .contains("notifications_failed_attempt_total")
+                .contains("notifications_dead_total")
+                .contains("ratelimit_rejected_total")
+                .contains("notifications_delivery_latency_seconds")
+                .contains("notifications_end_to_end_latency_seconds")
+                .contains("notifications_pending")
+                .contains("queue_depth");
+
+        // Auto-provided infrastructure metrics are exported too.
+        assertThat(body)
+                .contains("http_server_requests_seconds")
+                .contains("jvm_memory_used_bytes")
+                .contains("hikaricp_connections");
+    }
+
     // ---- helpers ----
+
+    private double counter(String name, String... tags) {
+        Counter c = meterRegistry.find(name).tags(tags).counter();
+        return c == null ? 0.0 : c.count();
+    }
 
     private MockHttpServletRequestBuilder notifyPost(String recipient, String apiKey) {
         return post("/notify")
