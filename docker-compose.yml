@@ -35,7 +35,37 @@ services:
     volumes:
       - notification-redis:/data
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: notification-prometheus
+    # Scrapes the app's /actuator/prometheus every 5s (see observability/prometheus/prometheus.yml).
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      # Lets the container reach the app running on the host (both 8080 and 8081).
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: notification-grafana
+    # Auto-provisioned with the Prometheus datasource + a dashboard, so it works on first boot.
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - notification-grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   notification-pgdata:
   notification-rabbitmq:
   notification-redis:
+  notification-grafana:
