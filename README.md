@@ -1,24 +1,26 @@
-# Notification Service (v7)
+# Notification Service (v8)
 
 An **asynchronous** notification service backed by **RabbitMQ**, with **Postgres**
 as the source of truth. `POST /notify` saves the notification as `PENDING`,
 publishes its id to a durable queue, and returns `202 Accepted` immediately. A
 pool of `@RabbitListener` consumers drains the queue and performs delivery, with
 **retries + backoff** and a **dead-letter queue** for permanent failures (v4),
-**idempotency** for an at-most-once send (v5), and **tenant identity via API keys**
-(v6).
+**idempotency** for an at-most-once send (v5), **tenant identity via API keys**
+(v6), and a **Redis-backed distributed rate limiter** (v7).
 
-v7 replaces v6's in-memory rate limiter with a **Redis-backed distributed rate
-limiter**, so a tenant's per-minute budget holds **across multiple app instances**.
-The check-and-decrement runs as an **atomic Lua script inside Redis**, which is what
-makes it correct under concurrency (see [Rate limiting](#rate-limiting-distributed-v7)).
+v8 adds **observability** — no new features, just visibility into what already
+exists. The app exports Micrometer metrics (custom business counters/timers/gauges
+plus the auto-provided HTTP/JVM/DB/Rabbit metrics) on a Prometheus endpoint, and the
+stack ships an auto-provisioned **Prometheus + Grafana** with a ready-made dashboard.
+See [Observability](#observability-v8).
 
 ## Stack
 
-- Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis)
+- Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis, Actuator)
 - PostgreSQL — source of truth (notifications + tenants)
 - RabbitMQ — message broker (with retries + dead-letter queue)
 - Redis — shared store for the distributed rate limiter
+- Micrometer + Prometheus + Grafana — metrics and dashboards
 - Maven
 
 ## Domain
@@ -251,7 +253,88 @@ Run two instances against the same Postgres + RabbitMQ + Redis:
 This is the property that failed in v6 and is pinned by the
 `limitHoldsAcrossTwoInstancesSharingOneRedis` test.
 
-## 1. Start Postgres + RabbitMQ + Redis
+## Observability (v8)
+
+The app is instrumented with [Micrometer](https://micrometer.io/) and exposes
+Actuator endpoints:
+
+| endpoint | purpose |
+|---|---|
+| `GET /actuator/health` | liveness/readiness |
+| `GET /actuator/metrics` | browse individual metrics |
+| `GET /actuator/prometheus` | Prometheus scrape endpoint (text exposition) |
+
+### Metrics
+
+Auto-provided by Spring Boot (verified in the scrape): `http_server_requests_seconds`
+(latency histogram + status counts), `jvm_*`, `hikaricp_connections*`, and the
+process/system metrics.
+
+Custom business metrics added in v8:
+
+| metric | type | tags | meaning |
+|---|---|---|---|
+| `notifications.submitted` | counter | tenant, channel | notification accepted & created |
+| `notifications.sent` | counter | tenant, channel | delivered successfully |
+| `notifications.failed_attempt` | counter | tenant | a delivery attempt failed (fires on **every** attempt, incl. retries) |
+| `notifications.dead` | counter | tenant | dead-lettered (retries exhausted) |
+| `ratelimit.rejected` | counter | tenant | request rejected with 429 |
+| `notifications.delivery.latency` | timer | — | duration of a `provider.send()` call |
+| `notifications.end_to_end.latency` | timer | — | accepted (`createdAt`) → sent (`sentAt`) |
+| `notifications.pending` | gauge | — | rows in PENDING status |
+| `queue.depth` | gauge | queue | RabbitMQ messages in `notifications.send` / `.dlq` |
+
+The two gauges are refreshed by a scheduled poller every 5s and cached, so a
+Prometheus scrape never triggers a `COUNT(*)` on a large table or a broker
+round-trip. Per-tenant metrics are tagged with the tenant **name** (e.g. `acme`).
+
+### Grafana dashboard
+
+`docker compose up -d` also starts **Prometheus** (scrapes the app every 5s) and
+**Grafana**, auto-provisioned with the Prometheus datasource **and** a dashboard —
+no manual clicking needed.
+
+- **Grafana:** http://localhost:3000 — login **admin / admin**. Open the
+  **Notification Service** dashboard.
+- **Prometheus:** http://localhost:9090 (e.g. Status → Targets).
+
+Prometheus scrapes the app on the host at `host.docker.internal:8080` and `:8081`
+(the second is DOWN until you start a second instance — see the rate-limiter
+section). Panels:
+
+| panel | what it tells you |
+|---|---|
+| POST /notify request rate by status | traffic and the mix of 202/200/429/401/400 |
+| POST /notify latency p50/p95/p99 | request-handling latency (should be ms — POST doesn't block on delivery) |
+| Throughput: submitted vs sent | intake vs delivery rate; a persistent gap = growing backlog |
+| Pending backlog | PENDING rows over time — watch it drain |
+| Queue depth main & DLQ | RabbitMQ readiness; DLQ climbing = permanent failures |
+| Failed attempts & dead-lettered | retry churn and give-ups |
+| **429 rate by tenant** | the **noisy-neighbor** view — who is hitting their limit |
+| Delivery latency (provider) heatmap | distribution of `provider.send()` time (~0.8s band) |
+| End-to-end latency p50/p95/p99 | accepted → actually sent, incl. queue wait + retries |
+| JVM heap / HikariCP active | runtime health and DB pool pressure |
+
+### Drive load with k6
+
+[`k6/load.js`](k6/load.js) simulates three tenants so the graphs show a readable
+shape, ramping over ~4 minutes:
+
+- **acme** (limit 60/min) — steady, well-behaved, stays under budget.
+- **globex** (limit 10/min) — periodic bursts over budget → 429 spikes.
+- **initech** (limit 5/min) — sustained flood far above budget → constant 429 (the
+  noisy neighbor).
+
+```bash
+# install k6 (macOS): brew install k6
+k6 run k6/load.js
+# against a second instance: BASE_URL=http://localhost:8081 k6 run k6/load.js
+```
+
+Watch the **429 rate by tenant** panel light up for globex/initech while acme stays
+green.
+
+## 1. Start the stack (Postgres + RabbitMQ + Redis + Prometheus + Grafana)
 
 ```bash
 docker compose up -d
@@ -267,6 +350,9 @@ This starts:
 - **Redis 7** on `localhost:6379` — the shared store for the distributed rate
   limiter. Inspect a bucket with
   `docker exec notification-redis redis-cli hgetall "ratelimit:<tenantId>"`.
+- **Prometheus** on **http://localhost:9090** — scrapes the app every 5s.
+- **Grafana** on **http://localhost:3000** (**admin / admin**) — pre-loaded with the
+  Notification Service dashboard.
 
 > **Upgrading an existing broker:** v4 adds dead-letter arguments to the
 > `notifications.send` queue. RabbitMQ refuses to redeclare an existing queue with
@@ -424,6 +510,12 @@ then replay in bulk via the Shovel plugin or a small admin endpoint.
   **Distributed correctness (v7):** two `RateLimiter` instances sharing one Redis are
   fired `2×limit` interleaved requests and admit **exactly `limit`** in total (not
   double) — the property that failed with the v6 in-memory limiter.
+  **Observability (v8):** `/actuator/prometheus` returns `200` and contains every
+  custom metric name; posting increments `notifications.submitted` and (once
+  delivered) `notifications.sent`; a rate-limited request increments
+  `ratelimit.rejected` with the right tenant tag; a dead-letter increments
+  `notifications.dead`. (`@AutoConfigureObservability` enables the real Prometheus
+  registry in the test — Spring Boot uses a `SimpleMeterRegistry` otherwise.)
 - `SimulatedProviderTest` — unit test for the stubbed provider.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the
