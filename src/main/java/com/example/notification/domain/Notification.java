@@ -5,13 +5,24 @@ import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 
 import java.time.Instant;
 import java.util.UUID;
 
 @Entity
-@Table(name = "notifications")
+@Table(
+        name = "notifications",
+        indexes = {
+                // Serves countByStatus(PENDING), polled every 5s by MetricsPoller.
+                @Index(name = "idx_notifications_status", columnList = "status"),
+                // Serves findByOrderByCreatedAtDesc.
+                @Index(name = "idx_notifications_created_at", columnList = "created_at"),
+                // Serves findByStatusOrderByCreatedAtDesc.
+                @Index(name = "idx_notifications_status_created_at", columnList = "status, created_at")
+        }
+)
 public class Notification {
 
     @Id
