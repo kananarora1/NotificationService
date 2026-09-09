@@ -11,7 +11,7 @@ import java.util.UUID;
 
 public interface NotificationRepository extends JpaRepository<Notification, UUID> {
 
-    Optional<Notification> findByIdempotencyKey(String idempotencyKey);
+    Optional<Notification> findByTenantIdAndIdempotencyKey(UUID tenantId, String idempotencyKey);
 
     long countByStatus(NotificationStatus status);
 

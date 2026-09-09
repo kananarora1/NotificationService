@@ -247,7 +247,7 @@ class NotificationIntegrationTest {
         UUID second = postWithKey("idem-a@example.com", key, status().isOk());
 
         assertThat(second).isEqualTo(first);
-        assertThat(repository.findByIdempotencyKey(key)).get()
+        assertThat(repository.findByTenantIdAndIdempotencyKey(tenantId(ACME_KEY), key)).get()
                 .extracting(Notification::getId).isEqualTo(first);
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
@@ -305,6 +305,42 @@ class NotificationIntegrationTest {
                 .filter(n -> recipient.equals(n.getRecipient()))
                 .count();
         assertThat(rows).isEqualTo(1);
+    }
+
+    // ---- per-tenant idempotency: the key is scoped to the tenant, not global ----
+
+    @Test
+    void sameIdempotencyKeyFromTwoTenantsCreatesSeparateRows() throws Exception {
+        String key = "shared-" + UUID.randomUUID();
+
+        MvcResult acmeResult = mockMvc.perform(notifyPost("tenant-a@example.com", ACME_KEY)
+                        .header("Idempotency-Key", key))
+                .andExpect(status().isAccepted())
+                .andReturn();
+        // Previously this returned 200 with acme's id — a cross-tenant leak.
+        MvcResult globexResult = mockMvc.perform(notifyPost("tenant-b@example.com", GLOBEX_KEY)
+                        .header("Idempotency-Key", key))
+                .andExpect(status().isAccepted())
+                .andReturn();
+
+        UUID acmeId = idFrom(acmeResult);
+        UUID globexId = idFrom(globexResult);
+        assertThat(globexId).isNotEqualTo(acmeId);
+
+        // Two distinct rows, each owned by its own tenant.
+        assertThat(repository.findByTenantIdAndIdempotencyKey(tenantId(ACME_KEY), key))
+                .get().extracting(Notification::getId).isEqualTo(acmeId);
+        assertThat(repository.findByTenantIdAndIdempotencyKey(tenantId(GLOBEX_KEY), key))
+                .get().extracting(Notification::getId).isEqualTo(globexId);
+        assertThat(repository.findById(acmeId).orElseThrow().getTenantId())
+                .isEqualTo(tenantId(ACME_KEY));
+        assertThat(repository.findById(globexId).orElseThrow().getTenantId())
+                .isEqualTo(tenantId(GLOBEX_KEY));
+
+        // Dedup still holds *within* a tenant.
+        mockMvc.perform(notifyPost("tenant-a@example.com", ACME_KEY)
+                        .header("Idempotency-Key", key))
+                .andExpect(status().isOk());
     }
 
     // ---- v5: processing-level idempotency ----
@@ -501,6 +537,10 @@ class NotificationIntegrationTest {
     }
 
     // ---- helpers ----
+
+    private UUID tenantId(String apiKey) {
+        return tenantRepository.findByApiKey(apiKey).orElseThrow().getId();
+    }
 
     private double counter(String name, String... tags) {
         Counter c = meterRegistry.find(name).tags(tags).counter();

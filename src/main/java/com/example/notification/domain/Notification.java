@@ -7,6 +7,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
 import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -21,7 +22,12 @@ import java.util.UUID;
                 @Index(name = "idx_notifications_created_at", columnList = "created_at"),
                 // Serves findByStatusOrderByCreatedAtDesc.
                 @Index(name = "idx_notifications_status_created_at", columnList = "status, created_at")
-        }
+        },
+        // Idempotency is scoped to the tenant: two tenants may reuse the same key
+        // without colliding (and without one seeing the other's notification).
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_notifications_tenant_idempotency_key",
+                columnNames = {"tenant_id", "idempotency_key"})
 )
 public class Notification {
 
@@ -40,10 +46,11 @@ public class Notification {
 
     /**
      * Caller-supplied idempotency key (from the {@code Idempotency-Key} header).
-     * Nullable, but UNIQUE: at most one row may exist per key. Postgres allows
-     * multiple NULLs, so key-less notifications never collide.
+     * Nullable, and UNIQUE <em>per tenant</em> (see the table's uniqueConstraints):
+     * at most one row may exist per (tenant, key). Postgres treats NULLs as distinct
+     * in a unique constraint, so key-less notifications never collide.
      */
-    @Column(name = "idempotency_key", unique = true)
+    @Column(name = "idempotency_key")
     private String idempotencyKey;
 
     /** The tenant (resolved from the API key) that created this notification. */

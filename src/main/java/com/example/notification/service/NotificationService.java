@@ -42,8 +42,9 @@ public class NotificationService {
      * <p>With no key this always persists a new PENDING row and publishes it for
      * delivery ({@code created = true}).
      *
-     * <p>With a key, at most one row exists per key. The check-then-insert is made
-     * race-safe by the UNIQUE constraint on {@code idempotency_key} rather than by
+     * <p>With a key, at most one row exists per (tenant, key). The check-then-insert
+     * is made race-safe by the UNIQUE constraint on
+     * {@code (tenant_id, idempotency_key)} rather than by
      * the (TOCTOU-prone) pre-check alone: if two identical requests race, exactly
      * one INSERT succeeds and the other catches the constraint violation and returns
      * the winner's row ({@code created = false}). Duplicates are never published.
@@ -55,8 +56,10 @@ public class NotificationService {
             return CreateResult.created(notification);
         }
 
-        // Fast path: an earlier request with this key already created the row.
-        var existing = repository.findByIdempotencyKey(idempotencyKey);
+        // Fast path: an earlier request from THIS tenant with this key already
+        // created the row. Scoped by tenant so one tenant never sees another's.
+        UUID tenantId = notification.getTenantId();
+        var existing = repository.findByTenantIdAndIdempotencyKey(tenantId, idempotencyKey);
         if (existing.isPresent()) {
             log.info("Idempotency-Key {} already maps to notification {}", idempotencyKey, existing.get().getId());
             return CreateResult.existing(existing.get());
@@ -70,7 +73,7 @@ public class NotificationService {
         } catch (DataIntegrityViolationException e) {
             // Lost the race: a concurrent request inserted the same key first. The
             // winner's row is committed, so re-fetch and return it without publishing.
-            Notification winner = repository.findByIdempotencyKey(idempotencyKey)
+            Notification winner = repository.findByTenantIdAndIdempotencyKey(tenantId, idempotencyKey)
                     .orElseThrow(() -> new IllegalStateException(
                             "Idempotency-Key " + idempotencyKey + " violated UNIQUE but no row found", e));
             log.info("Idempotency-Key {} race lost; returning existing notification {}",
