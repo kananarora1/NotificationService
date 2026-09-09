@@ -6,6 +6,10 @@ spring:
     hibernate:
       ddl-auto: create-drop
     open-in-view: false
+  data:
+    redis:
+      # Matches production; host/port come from the Redis container.
+      timeout: 200ms
   rabbitmq:
     listener:
       simple:

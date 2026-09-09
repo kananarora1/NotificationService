@@ -16,6 +16,10 @@ spring:
     redis:
       host: localhost
       port: 6379
+      # Cap the rate-limiter's Redis call. Without this, Lettuce's 60s default means a
+      # hung (not refused) Redis pins a Tomcat thread for a minute before the
+      # limiter's fail-open path is reached.
+      timeout: 200ms
   rabbitmq:
     host: localhost
     port: 5672
