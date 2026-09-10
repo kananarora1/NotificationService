@@ -6,8 +6,12 @@ import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * Registers the request interceptors for {@code POST /notify}. Order matters:
- * identity (API key) runs first, then the per-tenant rate limiter.
+ * Registers the request interceptors. Order matters: identity (API key) runs first,
+ * then the per-tenant rate limiter.
+ *
+ * <p>Auth covers the reads too ({@code GET /notify/{id}}, {@code GET /notifications}),
+ * which are tenant-scoped in their controllers. The rate limiter stays on
+ * {@code POST /notify} only — reads do not consume the tenant's send budget.
  */
 @Configuration
 public class WebConfig implements WebMvcConfigurer {
@@ -23,7 +27,8 @@ public class WebConfig implements WebMvcConfigurer {
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
-        registry.addInterceptor(apiKeyAuthInterceptor).addPathPatterns("/notify");
+        registry.addInterceptor(apiKeyAuthInterceptor)
+                .addPathPatterns("/notify", "/notify/*", "/notifications");
         registry.addInterceptor(rateLimitInterceptor).addPathPatterns("/notify");
     }
 }

@@ -14,6 +14,7 @@ import org.springframework.util.StringUtils;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -149,8 +150,17 @@ public class NotificationService {
         return notification.getAttempts();
     }
 
-    public Notification get(UUID id) {
-        return repository.findById(id)
+    /**
+     * Reads a notification on behalf of a tenant. A row belonging to a different
+     * tenant is reported as <b>not found</b> rather than forbidden, so the endpoint
+     * does not leak which ids exist.
+     */
+    public Notification get(UUID id, UUID tenantId) {
+        Notification notification = repository.findById(id)
                 .orElseThrow(() -> new NotificationNotFoundException(id));
+        if (!Objects.equals(notification.getTenantId(), tenantId)) {
+            throw new NotificationNotFoundException(id);
+        }
+        return notification;
     }
 }

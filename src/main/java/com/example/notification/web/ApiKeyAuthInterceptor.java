@@ -4,7 +4,6 @@ import com.example.notification.tenant.Tenant;
 import com.example.notification.tenant.TenantRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.servlet.HandlerInterceptor;
@@ -12,10 +11,12 @@ import org.springframework.web.servlet.HandlerInterceptor;
 import java.util.Optional;
 
 /**
- * Identity gate for POST /notify. Requires an {@code X-API-Key} header, resolves it
- * to a {@link Tenant}, and stashes the tenant as a request attribute for downstream
- * use (rate limiting, persisting tenant_id). A missing or unknown key is rejected
- * with 401 before the controller runs.
+ * Identity gate for the notification endpoints (see {@code WebConfig} for the exact
+ * paths). Requires an {@code X-API-Key} header, resolves it to a {@link Tenant}, and
+ * stashes the tenant as a request attribute for downstream use (rate limiting,
+ * persisting tenant_id, scoping reads). A missing or unknown key is rejected with 401
+ * before the controller runs. Applies to every HTTP method, reads included — the read
+ * endpoints return other tenants' recipients and message bodies otherwise.
  */
 @Component
 public class ApiKeyAuthInterceptor implements HandlerInterceptor {
@@ -31,11 +32,6 @@ public class ApiKeyAuthInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
-        // Only POST /notify is gated; the read endpoint stays open.
-        if (!HttpMethod.POST.matches(request.getMethod())) {
-            return true;
-        }
-
         String apiKey = request.getHeader(API_KEY_HEADER);
         if (!StringUtils.hasText(apiKey)) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);

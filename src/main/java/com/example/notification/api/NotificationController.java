@@ -56,7 +56,9 @@ public class NotificationController {
     }
 
     @GetMapping("/{id}")
-    public NotificationView get(@PathVariable UUID id) {
-        return NotificationView.from(service.get(id));
+    public NotificationView get(@PathVariable UUID id,
+                                @RequestAttribute(ApiKeyAuthInterceptor.TENANT_ATTRIBUTE) Tenant tenant) {
+        // Scoped to the caller's tenant: another tenant's id reads as 404.
+        return NotificationView.from(service.get(id, tenant.getId()));
     }
 }

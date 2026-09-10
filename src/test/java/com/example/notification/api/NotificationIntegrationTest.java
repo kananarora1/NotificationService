@@ -46,6 +46,7 @@ import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -202,7 +203,8 @@ class NotificationIntegrationTest {
         UUID id = postNotify("bob@example.com");
 
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
-                mockMvc.perform(get("/notify/{id}", id.toString()))
+                mockMvc.perform(get("/notify/{id}", id.toString())
+                                .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
                         .andExpect(status().isOk())
                         .andExpect(jsonPath("$.status").value("SENT"))
                         .andExpect(jsonPath("$.attempts").value(1))
@@ -211,7 +213,8 @@ class NotificationIntegrationTest {
 
     @Test
     void getUnknownIdReturns404() throws Exception {
-        mockMvc.perform(get("/notify/{id}", UUID.randomUUID()))
+        mockMvc.perform(get("/notify/{id}", UUID.randomUUID())
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
                 .andExpect(status().isNotFound());
     }
 
@@ -341,6 +344,63 @@ class NotificationIntegrationTest {
         mockMvc.perform(notifyPost("tenant-a@example.com", ACME_KEY)
                         .header("Idempotency-Key", key))
                 .andExpect(status().isOk());
+    }
+
+    // ---- tenant-scoped reads ----
+
+    @Test
+    void unauthenticatedGetByIdReturns401() throws Exception {
+        UUID id = postNotify("read-auth@example.com");
+
+        mockMvc.perform(get("/notify/{id}", id.toString()))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void unauthenticatedListReturns401() throws Exception {
+        mockMvc.perform(get("/notifications"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void getAnotherTenantsNotificationReturns404() throws Exception {
+        UUID acmeId = postNotify("acme-private@example.com");
+
+        // 404, not 403: the endpoint must not confirm the id exists.
+        mockMvc.perform(get("/notify/{id}", acmeId.toString())
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, GLOBEX_KEY))
+                .andExpect(status().isNotFound());
+
+        // The owning tenant still reads it.
+        mockMvc.perform(get("/notify/{id}", acmeId.toString())
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(acmeId.toString()));
+    }
+
+    @Test
+    void listReturnsOnlyCallersRows() throws Exception {
+        UUID acmeId = postNotify("list-acme@example.com");
+        UUID globexId = idFrom(mockMvc.perform(notifyPost("list-globex@example.com", GLOBEX_KEY))
+                .andExpect(status().isAccepted())
+                .andReturn());
+
+        String body = mockMvc.perform(get("/notifications")
+                        .param("limit", "200")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, GLOBEX_KEY))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        List<String> ids = new ArrayList<>();
+        List<String> tenants = new ArrayList<>();
+        objectMapper.readTree(body).forEach(n -> {
+            ids.add(n.get("id").asText());
+            tenants.add(n.get("tenant").asText());
+        });
+
+        assertThat(ids).contains(globexId.toString());
+        assertThat(ids).doesNotContain(acmeId.toString());
+        assertThat(tenants).isNotEmpty().containsOnly("globex");
     }
 
     // ---- v5: processing-level idempotency ----
