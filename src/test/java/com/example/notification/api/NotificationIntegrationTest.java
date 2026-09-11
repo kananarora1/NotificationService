@@ -419,6 +419,48 @@ class NotificationIntegrationTest {
                 .isEqualTo(NotificationStatus.SENT);
     }
 
+    @Test
+    void concurrentDeliveryAttemptsSendExactlyOnce() throws Exception {
+        // Two consumers racing on the same id — the shape a broker redelivery creates
+        // while the original delivery is still in flight. Sequential skipping (see
+        // processingIdempotencySkipsAlreadySentOnRedelivery) does not cover this: both
+        // threads read PENDING before either writes.
+        Notification n = new Notification("race-send@example.com", Channel.EMAIL, "once");
+        repository.save(n);
+        UUID id = n.getId();
+
+        int threads = 2;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch go = new CountDownLatch(1);
+
+        try {
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                        service.attemptDelivery(id);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+            ready.await(5, TimeUnit.SECONDS);
+            go.countDown();
+            pool.shutdown();
+            assertThat(pool.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // Exactly one thread won the PENDING -> SENDING claim and called the provider.
+        assertThat(provider.invocationTimes(id)).hasSize(1);
+        Notification stored = repository.findById(id).orElseThrow();
+        assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(stored.getAttempts()).isEqualTo(1);
+    }
+
     // ---- v6 Stage 1: API key identity ----
 
     @Test

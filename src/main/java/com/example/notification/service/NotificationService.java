@@ -1,7 +1,6 @@
 package com.example.notification.service;
 
 import com.example.notification.domain.Notification;
-import com.example.notification.domain.NotificationStatus;
 import com.example.notification.messaging.NotificationPublisher;
 import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.provider.NotificationProvider;
@@ -91,26 +90,37 @@ public class NotificationService {
      * once per retry attempt. Increments the attempt counter, calls the provider,
      * and marks SENT on success.
      *
-     * <p>On a provider failure the exception is <b>rethrown</b> so the listener's
-     * retry interceptor can back off and retry — the status is deliberately left
-     * PENDING (not FAILED). When retries are finally exhausted the message is
-     * dead-lettered and {@link #markDead(UUID, String)} flips it to DEAD.
+     * <p>On a provider failure the claim is released (back to PENDING, not FAILED) and
+     * the exception is <b>rethrown</b> so the listener's retry interceptor can back off
+     * and retry. When retries are finally exhausted the message is dead-lettered and
+     * {@link #markDead(UUID, String)} flips it to DEAD.
      *
-     * <p>Processing idempotency: a message that has already reached a terminal state
-     * (SENT or DEAD) is skipped without calling the provider, so a redelivery sends
-     * at most once. Only PENDING notifications are delivered.
+     * <p>Processing idempotency: delivery is gated by an atomic PENDING -> SENDING
+     * claim, so a row that is already terminal (SENT/DEAD) or in flight on another
+     * consumer is skipped without calling the provider. That makes a redelivery safe
+     * even when it races the original delivery rather than following it.
      */
     public void attemptDelivery(UUID id) {
-        Notification notification = repository.findById(id).orElse(null);
-        if (notification == null) {
-            // The id was published but the row is gone (e.g. wiped between tests).
-            log.warn("No notification found for published id {}; skipping", id);
+        // Atomic claim: PENDING -> SENDING in one conditional UPDATE, so of two
+        // concurrent redeliveries exactly one proceeds to the provider. This is its
+        // own short transaction and commits before the (slow) send below runs.
+        if (repository.claimForSending(id) == 0) {
+            Notification current = repository.findById(id).orElse(null);
+            if (current == null) {
+                // The id was published but the row is gone (e.g. wiped between tests).
+                log.warn("No notification found for published id {}; skipping", id);
+            } else {
+                // SENT/DEAD, or another consumer holds the claim. Ack without resending.
+                log.info("skipping already-processed {} (status {})", id, current.getStatus());
+            }
             return;
         }
 
-        if (notification.getStatus() != NotificationStatus.PENDING) {
-            // Already SENT or DEAD — a duplicate/redelivered message. Ack without resending.
-            log.info("skipping already-processed {} (status {})", id, notification.getStatus());
+        // Read AFTER the claim so the in-memory copy carries SENDING; reading first
+        // would make the merge below write the stale PENDING back over the claim.
+        Notification notification = repository.findById(id).orElse(null);
+        if (notification == null) {
+            log.warn("No notification found for published id {}; skipping", id);
             return;
         }
 
@@ -125,6 +135,11 @@ public class NotificationService {
         } catch (RuntimeException e) {
             metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
             metrics.failedAttempt(tenant);
+            // Release the claim (SENDING -> PENDING) before rethrowing: the listener's
+            // retry re-enters this method and must be able to win the claim again.
+            // Without this every retry would skip and the message would never be
+            // dead-lettered. A crash here instead leaves the row stuck in SENDING.
+            repository.releaseClaim(id);
             throw e;
         }
         metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
