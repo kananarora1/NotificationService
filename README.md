@@ -508,6 +508,51 @@ underlying cause is permanent — e.g. `fail@example.com` — it will simply be
 dead-lettered again.) For a real system you'd typically fix the root cause first,
 then replay in bulk via the Shovel plugin or a small admin endpoint.
 
+## Operations
+
+### Alert rules
+
+[`observability/prometheus/alerts.yml`](observability/prometheus/alerts.yml) is mounted
+into Prometheus and visible at **http://localhost:9090/alerts**. Every threshold is
+commented in the file so it is easy to tune — they are sized for the demo scale, not
+for production traffic.
+
+Alertmanager is **not** wired up; the rules are fully usable from the Prometheus UI
+without it. `prometheus.yml` has a commented `alerting:` block if you want to add one.
+
+| alert | fires when | what a responder does |
+|---|---|---|
+| **DeadLetterGrowing** `critical` | any notification was dead-lettered in the last 10m (`for: 2m`) | These gave up and will **not** retry themselves. Read `failure_reason` on the `DEAD` rows, fix the cause, then replay onto `notifications.send`. |
+| **DeadLetterQueueNotDraining** `critical` | `notifications.dlq` depth > 0 for 5m | `DeadLetterListener` is stuck or down, so failures are no longer being recorded as `DEAD`. Check the app logs and `rabbitmqctl list_queues name messages consumers`. |
+| **PendingBacklogHigh** `warning` | `notifications_pending > 100` for 5m | Consumers are behind. Check `queue_depth` for the work queue, that instances are alive, and whether the provider slowed down. |
+| **HighErrorRate** `warning` | failed attempts > 0.2/s for 5m | Retries may still recover these, but sustained failure leads to dead-letters. Check provider health and the recurring exception. |
+| **TargetDown** `critical` | `up == 0` for 1m | An instance stopped being scraped. If it is the only one, the service is down. |
+| **RateLimitRejectionsSpike** `warning` | a tenant's 429 rate > 1/s for 5m | Decide: abuse (a client retrying without honouring `Retry-After`) or a tenant that needs a bigger `rate_limit_per_minute`. |
+| **HighEndToEndLatencyP99** `warning` | p99 submit→deliver > 5s for 10m | Compare against `notifications_delivery_latency_seconds`. If provider time is flat, the latency is queueing — check the backlog. |
+
+Two things worth knowing about these rules:
+
+- **`DeadLetterGrowing` counts `notifications_dead_total`, not DLQ depth.** The obvious
+  rule — `queue_depth{queue="notifications.dlq"} > 0` — would essentially never fire,
+  because `DeadLetterListener` consumes the DLQ and drains it to zero within
+  milliseconds. Depth-based alerting on that queue detects a *broken consumer*, which is
+  why it is a separate alert (`DeadLetterQueueNotDraining`) rather than the primary one.
+- **It is also not written with `increase()`,** for a reason worth knowing before you
+  write the next counter alert. A Micrometer counter series does not exist until its
+  first increment, so when the first dead-letters after a restart all land within one
+  5s scrape, the series is *born* at its full value. `increase()` then sees a flat line
+  and reports 0 — this was observed silently missing three real dead-letters. The rule
+  subtracts the value 10 minutes ago instead, with `or vector(0)` on both sides so an
+  absent series reads as zero:
+
+  ```promql
+  (sum(notifications_dead_total) or vector(0))
+    - (sum(notifications_dead_total offset 10m) or vector(0)) > 0
+  ```
+- **`TargetDown` fires out of the box.** `prometheus.yml` scrapes both `app-8080` and
+  `app-8081`, and 8081 is not running unless you start a second instance by hand. Remove
+  that target to silence it.
+
 ## Configuration & secrets
 
 No credential is hardcoded. Every setting in `application.yml` is read from an

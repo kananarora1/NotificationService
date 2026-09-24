@@ -45,7 +45,8 @@ services:
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Whole directory, not just prometheus.yml, so alerts.yml is mounted too.
+      - ./observability/prometheus:/etc/prometheus:ro
     extra_hosts:
       # Lets the container reach the app running on the host (both 8080 and 8081).
       - "host.docker.internal:host-gateway"

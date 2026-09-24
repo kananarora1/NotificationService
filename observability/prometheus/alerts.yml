@@ -1,0 +1,192 @@
+# Alert rules for the notification service.
+#
+# Thresholds are tuned for the DEMO scale (a single host instance, a simulated
+# provider with ~800ms latency, tenant budgets of 5-60 requests/minute). Every one is
+# called out in a comment below — retune them against real traffic before trusting
+# them. Visible in the Prometheus UI under Alerts (http://localhost:9090/alerts).
+#
+# A note on 'for:' durations: Prometheus evaluates every 5s here, so a rule with
+# for: 2m needs the condition to hold across ~24 consecutive evaluations before it
+# moves from PENDING to FIRING. Short 'for:' = faster paging but more flapping.
+
+groups:
+  - name: notification-service-delivery
+    rules:
+
+      # ---- 1. The highest-value alert: notifications are dying permanently. ----
+      #
+      # Deliberately counter-based, NOT queue-depth based. notifications.dlq has a
+      # live consumer (DeadLetterListener) that drains it to zero within milliseconds,
+      # so `queue_depth{queue="notifications.dlq"} > 0` almost never holds long enough
+      # to fire. notifications_dead_total increments once per dead-lettered
+      # notification and never goes back down, so it sees every one of them.
+      #
+      # NOT written as `increase(notifications_dead_total[10m]) > 0`, which has a real
+      # blind spot: a Micrometer counter series does not exist until its first
+      # increment, so if the first dead-letters after a restart all land inside one
+      # scrape interval, the series is BORN at 3 and increase() sees a flat line and
+      # reports 0. Measured — the alert stayed silent through 3 real dead-letters.
+      # Subtracting the value 10m ago, with `or vector(0)` on both sides so an absent
+      # series reads as 0, catches that case as well as the steady-state one.
+      #
+      # TUNE: `> 0` means "any notification at all gave up" — correct for the demo,
+      # probably too sensitive in production. A real deployment wants `> 5` here, or a
+      # ratio against notifications_submitted_total.
+      - alert: DeadLetterGrowing
+        expr: >-
+          (sum(notifications_dead_total) or vector(0))
+          - (sum(notifications_dead_total offset 10m) or vector(0)) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Notifications are being dead-lettered"
+          description: >-
+            {{ $value | printf "%.0f" }} notification(s) exhausted their retries in the
+            last 10 minutes and were dead-lettered (status DEAD). These will NOT be
+            retried automatically. Responder: query the DEAD rows for failure_reason,
+            fix the underlying cause, then replay them onto notifications.send (see
+            "Replay a dead-lettered message" in the README).
+
+      # ---- 2. The DLQ itself is backing up: its consumer is stuck or down. ----
+      #
+      # A different failure from the one above. Depth stays at 0 in normal operation
+      # precisely BECAUSE DeadLetterListener consumes it, so a sustained non-zero depth
+      # means that listener has stopped — dead notifications are no longer being
+      # recorded as DEAD in the database.
+      #
+      # TUNE: > 0 for 5m. Any sustained depth is abnormal here.
+      - alert: DeadLetterQueueNotDraining
+        expr: queue_depth{queue="notifications.dlq"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-letter queue is not draining"
+          description: >-
+            notifications.dlq has held {{ $value | printf "%.0f" }} message(s) for over
+            5 minutes. It normally sits at zero because DeadLetterListener consumes it,
+            so this means that consumer is down, stuck, or erroring. Responder: check
+            the app logs for DeadLetterListener exceptions and confirm the queue still
+            has consumers (`rabbitmqctl list_queues name messages consumers`).
+
+      # ---- 3. Consumers are falling behind the producers. ----
+      #
+      # TUNE: 100 pending rows. At 16 consumers x ~800ms per send the service clears
+      # roughly 20/s, so a sustained 100 means the backlog is not draining, not just a
+      # burst. Raise this in proportion to real throughput.
+      - alert: PendingBacklogHigh
+        expr: notifications_pending > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pending notification backlog is high"
+          description: >-
+            {{ $value | printf "%.0f" }} notifications have been stuck in PENDING for
+            over 5 minutes — consumers are not keeping up with submissions. Responder:
+            check queue_depth for notifications.send, whether the app instances are
+            alive, and whether the provider has slowed down
+            (notifications_delivery_latency_seconds).
+
+      # ---- 4. Delivery attempts are failing at an elevated rate. ----
+      #
+      # Counts every failed attempt including retries, so a single permanently-failing
+      # notification contributes ~4 (retry.max-attempts). Rate, not absolute count, so
+      # it reflects current conditions rather than history.
+      #
+      # Same counter-birth caveat as DeadLetterGrowing applies in principle, but it
+      # matters far less here: this rule needs a SUSTAINED rate over 5m to fire, which
+      # by definition means many samples, not a single burst inside one scrape.
+      #
+      # TUNE: 0.2/s ~= 12 failed attempts/minute. For the demo that is clearly abnormal;
+      # size it against your own submission rate, or switch to a ratio:
+      #   sum(rate(notifications_failed_attempt_total[5m]))
+      #     / sum(rate(notifications_submitted_total[5m])) > 0.1
+      - alert: HighErrorRate
+        expr: sum(rate(notifications_failed_attempt_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated delivery failure rate"
+          description: >-
+            Delivery attempts are failing at {{ $value | printf "%.2f" }}/s averaged
+            over 5 minutes. Retries may still be recovering these, but a sustained rate
+            leads to dead-letters. Responder: check the provider's health and the app
+            logs for the recurring exception.
+
+      # ---- 6. End-to-end latency has regressed. ----
+      #
+      # Wall-clock from POST /notify (createdAt) to delivery (sentAt), so it includes
+      # queue wait — this catches a backlog as well as a slow provider.
+      #
+      # TUNE: p99 > 5s. The provider alone costs ~0.8s, so 5s means queueing or retry
+      # backoff dominates. Requires percentiles-histogram to be enabled for this timer
+      # (it is, under management.metrics.distribution).
+      - alert: HighEndToEndLatencyP99
+        expr: >-
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(notifications_end_to_end_latency_seconds_bucket[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 end-to-end notification latency above 5s"
+          description: >-
+            p99 latency from submission to delivery is
+            {{ $value | printf "%.1f" }}s over the last 5 minutes. Responder: compare
+            against notifications_delivery_latency_seconds (provider time only) — if
+            that is flat, the time is being spent queued, so check notifications_pending
+            and consumer health.
+
+  - name: notification-service-availability
+    rules:
+
+      # ---- 5. An instance stopped being scraped. ----
+      #
+      # NOTE for this demo setup: prometheus.yml lists both app-8080 and app-8081, and
+      # 8081 is not running unless you start a second instance by hand. This alert is
+      # therefore EXPECTED to be firing for app-8081 out of the box — that is the
+      # demonstration, not a misconfiguration. Drop the 8081 target from prometheus.yml
+      # to silence it.
+      #
+      # TUNE: 1m is short enough to catch a crash quickly without firing on a restart.
+      - alert: TargetDown
+        expr: up{job="notification-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instance {{ $labels.instance_name }} is down"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }}
+            ({{ $labels.instance_name }}) for over a minute. If this is the only
+            instance, the service is down and POST /notify is unavailable. Responder:
+            check the process is alive and /actuator/health is reachable.
+
+  - name: notification-service-abuse
+    rules:
+
+      # ---- 7. One tenant is being rate-limited hard. ----
+      #
+      # Per-tenant (by (tenant)) so one noisy tenant is named in the alert rather than
+      # averaged away. Sustained 429s mean either a misbehaving client retrying in a
+      # loop, or a tenant that has genuinely outgrown its budget.
+      #
+      # TUNE: 1/s ~= 60 rejections/minute. Tenant budgets here are 5-60/min, so this is
+      # a client hammering well past its allowance rather than brushing the limit.
+      - alert: RateLimitRejectionsSpike
+        expr: sum by (tenant) (rate(ratelimit_rejected_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tenant {{ $labels.tenant }} is being rate-limited heavily"
+          description: >-
+            Tenant {{ $labels.tenant }} is being rejected with 429 at
+            {{ $value | printf "%.2f" }}/s over 5 minutes. Responder: decide whether
+            this is abuse (a client retrying without backoff — the 429 carries
+            Retry-After) or a tenant that needs its rate_limit_per_minute raised.
