@@ -510,6 +510,74 @@ then replay in bulk via the Shovel plugin or a small admin endpoint.
 
 ## Operations
 
+### Graceful shutdown
+
+On `SIGTERM` (a `docker stop`, a Kubernetes pod eviction, `Ctrl-C`) the app drains
+instead of dying mid-delivery:
+
+```yaml
+server:
+  shutdown: graceful          # drain in-flight HTTP requests
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+notifications:
+  listener:
+    shutdown-timeout: 25s     # bound on the RabbitMQ listener drain
+```
+
+`server.shutdown: graceful` covers the **HTTP connector only** — Spring Boot knows
+nothing about message listeners. The listener side is configured separately in
+`ListenerShutdownConfig`, which raises Spring AMQP's `shutdownTimeout` from its 5s
+default. With an 800ms-per-send provider and retry backoff, 5s is not enough to finish
+what is in flight.
+
+**What happens to in-flight messages on deploy** (measured, not assumed — see below):
+
+| | behaviour |
+|---|---|
+| HTTP request already executing | runs to completion; Tomcat stops accepting new connections first |
+| `@RabbitListener` invocation already executing | **runs to completion and acks** — never abandoned mid-send |
+| Message prefetched but not yet started | **requeued untouched** (`attempts` still 0), picked up by the next instance |
+| Message still in the queue | untouched, waits for the next consumer |
+
+The middle two are the important ones. A notification the provider has already
+accepted is never redelivered, so no duplicate send. A notification that had not
+started yet goes back on the queue rather than being lost.
+
+One thing that looks alarming in the logs but is correct:
+
+```
+Rejecting received message(s) because the listener container has been stopped
+```
+
+That is the prefetched-but-unstarted batch being handed back. It **requeues** — it does
+not route to the DLQ, despite `default-requeue-rejected: false`, which governs listener
+*failures* rather than container shutdown. Those messages come back as `ready`, not
+`unacked`.
+
+**Verified under load.** 60 notifications submitted against the 800ms provider, then
+`SIGTERM` while 16 were mid-send:
+
+| | at SIGTERM | after shutdown | after restart |
+|---|---|---|---|
+| `SENT` | 16 | 48 (all `attempts = 1`) | 60 (all `attempts = 1`) |
+| `SENDING` (in flight) | 16 | 0 | 0 |
+| queue `ready` | 28 | 12 | 0 |
+| queue `unacked` | 28 | **0** | 0 |
+| dead-lettered | 0 | **0** | 0 |
+
+Every one of the 16 in-flight sends finished and acked. Nothing was left unacked,
+nothing was dead-lettered, and every notification ended `SENT` with `attempts = 1` —
+so nothing was delivered twice.
+
+**Containerised deployments** must give Docker a `stop_grace_period` comfortably above
+the app's own budget, or the JVM is `SIGKILL`ed mid-drain and the guarantees above are
+void. The worst case is roughly two shutdown phases back to back (HTTP drain, then
+listener drain), so with the 30s default use **90s**. `docker-compose.yml` carries a
+ready-to-use `app` service block showing this; the app currently runs on the host, so
+there is no app container in the compose file yet.
+
 ### Alert rules
 
 [`observability/prometheus/alerts.yml`](observability/prometheus/alerts.yml) is mounted

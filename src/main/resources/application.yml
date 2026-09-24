@@ -1,6 +1,12 @@
 spring:
   application:
     name: notification-service
+  lifecycle:
+    # Budget for EACH SmartLifecycle shutdown phase (the web server's drain and the
+    # RabbitMQ listener's drain are separate phases, so worst case is roughly two of
+    # these back to back). Must stay below the container's stop_grace_period, or
+    # Docker SIGKILLs mid-drain — see docker-compose.yml.
+    timeout-per-shutdown-phase: ${SHUTDOWN_TIMEOUT:30s}
   datasource:
     # Every credential comes from the environment. The defaults after ':' are the
     # local docker-compose values and are deliberately non-secret — a real deployment
@@ -60,8 +66,16 @@ spring:
 
 server:
   port: ${SERVER_PORT:8080}
+  # Stop accepting new connections on SIGTERM, then let in-flight HTTP requests
+  # finish before the connector closes. Bounded by
+  # spring.lifecycle.timeout-per-shutdown-phase below.
+  shutdown: graceful
 
 notifications:
+  listener:
+    # How long the RabbitMQ listener containers may spend draining in-flight and
+    # prefetched messages on shutdown. Keep below timeout-per-shutdown-phase (30s).
+    shutdown-timeout: ${LISTENER_SHUTDOWN_TIMEOUT:25s}
   seeding:
     # Local-development convenience: ensures these tenants exist on startup, storing
     # only the SHA-256 hash of each key. Set SEED_TENANTS_ENABLED=false in production

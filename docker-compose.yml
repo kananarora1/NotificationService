@@ -2,6 +2,8 @@ services:
   postgres:
     image: postgres:16
     container_name: notification-postgres
+    # Generous window to let Postgres finish its shutdown checkpoint rather than be SIGKILLed.
+    stop_grace_period: 60s
     environment:
       # Values come from .env, which docker compose reads from this directory
       # automatically. The ":-" fallbacks keep a bare `docker compose up` working for
@@ -18,6 +20,8 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management
     container_name: notification-rabbitmq
+    # Generous window to let RabbitMQ flush its message store rather than be SIGKILLed.
+    stop_grace_period: 60s
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
@@ -67,6 +71,28 @@ services:
       - notification-grafana:/var/lib/grafana
     depends_on:
       - prometheus
+
+# ---------------------------------------------------------------------------
+# The app itself runs on the HOST (`./mvnw spring-boot:run`), so there is no app
+# container here to give a stop_grace_period to. When you do containerize it, the
+# service needs to look like this — Docker sends SIGTERM, waits stop_grace_period,
+# then SIGKILLs, so that window must exceed the app's own shutdown budget:
+#
+#   app:
+#     build: .
+#     container_name: notification-app
+#     # 30s per shutdown phase (spring.lifecycle.timeout-per-shutdown-phase) x2 phases
+#     # (HTTP drain, then listener drain) + headroom. Too low and Docker kills the JVM
+#     # mid-drain, which is exactly the redelivery the graceful shutdown prevents.
+#     stop_grace_period: 90s
+#     environment:
+#       DB_URL: jdbc:postgresql://postgres:5432/notifications
+#       RABBITMQ_HOST: rabbitmq
+#       REDIS_HOST: redis
+#     depends_on: [postgres, rabbitmq, redis]
+#     ports:
+#       - "${SERVER_PORT:-8080}:8080"
+# ---------------------------------------------------------------------------
 
 volumes:
   notification-pgdata:
