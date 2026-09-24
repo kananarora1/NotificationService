@@ -2,9 +2,13 @@ spring:
   application:
     name: notification-service
   datasource:
-    url: jdbc:postgresql://localhost:5433/notifications
-    username: notifications
-    password: notifications
+    # Every credential comes from the environment. The defaults after ':' are the
+    # local docker-compose values and are deliberately non-secret — a real deployment
+    # supplies DB_URL/DB_USERNAME/DB_PASSWORD and never falls through to them.
+    # See .env.example for the full list.
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/notifications}
+    username: ${DB_USERNAME:notifications}
+    password: ${DB_PASSWORD:notifications}
   flyway:
     enabled: true
     locations: classpath:db/migration
@@ -28,17 +32,18 @@ spring:
     open-in-view: false
   data:
     redis:
-      host: localhost
-      port: 6379
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
       # Cap the rate-limiter's Redis call. Without this, Lettuce's 60s default means a
       # hung (not refused) Redis pins a Tomcat thread for a minute before the
       # limiter's fail-open path is reached.
       timeout: 200ms
   rabbitmq:
-    host: localhost
-    port: 5672
-    username: guest
-    password: guest
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
     listener:
       simple:
         concurrency: 16
@@ -54,7 +59,24 @@ spring:
           max-interval: 10000      # capped at 10s
 
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
+
+notifications:
+  seeding:
+    # Local-development convenience: ensures these tenants exist on startup, storing
+    # only the SHA-256 hash of each key. Set SEED_TENANTS_ENABLED=false in production
+    # and provision tenants deliberately (see "Adding a tenant" in the README).
+    enabled: ${SEED_TENANTS_ENABLED:true}
+    tenants:
+      - name: acme
+        api-key: ${ACME_API_KEY:key-acme}
+        rate-limit-per-minute: ${ACME_RATE_LIMIT:60}
+      - name: globex
+        api-key: ${GLOBEX_API_KEY:key-globex}
+        rate-limit-per-minute: ${GLOBEX_RATE_LIMIT:10}
+      - name: initech
+        api-key: ${INITECH_API_KEY:key-initech}
+        rate-limit-per-minute: ${INITECH_RATE_LIMIT:5}
 
 management:
   endpoints:

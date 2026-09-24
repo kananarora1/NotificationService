@@ -27,3 +27,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Secrets / local environment — never commit. Use .env.example as the template.
+.env
+.env.*
+!.env.example

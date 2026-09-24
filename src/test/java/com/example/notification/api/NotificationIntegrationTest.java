@@ -8,6 +8,7 @@ import com.example.notification.ratelimit.RateLimiter;
 import com.example.notification.repository.NotificationRepository;
 import com.example.notification.service.NotificationService;
 import com.example.notification.support.MutableClock;
+import com.example.notification.tenant.ApiKeyHasher;
 import com.example.notification.tenant.Tenant;
 import com.example.notification.tenant.TenantRepository;
 import com.example.notification.web.ApiKeyAuthInterceptor;
@@ -28,6 +29,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -136,6 +138,9 @@ class NotificationIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @BeforeEach
     void resetRateLimiterState() {
@@ -545,7 +550,7 @@ class NotificationIntegrationTest {
         RateLimiter instanceA = new RateLimiter(redisTemplate, tokenBucketScript, clock);
         RateLimiter instanceB = new RateLimiter(redisTemplate, tokenBucketScript, clock);
 
-        Tenant globex = tenantRepository.findByApiKey(GLOBEX_KEY).orElseThrow();
+        Tenant globex = tenantByKey(GLOBEX_KEY);
         int limit = globex.getRateLimitPerMinute(); // 10
 
         int allowed = 0;
@@ -638,10 +643,87 @@ class NotificationIntegrationTest {
                 .contains("hikaricp_connections");
     }
 
+    // ---- v9: API keys stored as SHA-256 hashes ----
+
+    @Test
+    void existingDevKeysStillAuthenticateAfterHashing() throws Exception {
+        // The storage format changed; the contract with the client did not. The same
+        // keys that worked before V3/V4 still authenticate and resolve the same tenant.
+        for (String key : List.of(ACME_KEY, GLOBEX_KEY, INITECH_KEY)) {
+            mockMvc.perform(get("/notifications").header(ApiKeyAuthInterceptor.API_KEY_HEADER, key))
+                    .andExpect(status().isOk());
+        }
+
+        assertThat(tenantByKey(ACME_KEY).getName()).isEqualTo("acme");
+        assertThat(tenantByKey(GLOBEX_KEY).getName()).isEqualTo("globex");
+        assertThat(tenantByKey(INITECH_KEY).getName()).isEqualTo("initech");
+    }
+
+    @Test
+    void unknownKeyIsStillRejectedWhenHashed() throws Exception {
+        // A key that hashes to nothing on file: the lookup misses, so 401 — the same
+        // outcome as before, reached through the hash index.
+        mockMvc.perform(notifyPost("alice@example.com", "key-not-issued"))
+                .andExpect(status().isUnauthorized());
+
+        assertThat(tenantRepository.findByApiKeyHash(ApiKeyHasher.sha256Hex("key-not-issued")))
+                .isEmpty();
+    }
+
+    @Test
+    void tenantsTableHasNoPlaintextApiKeyColumnAfterV4() {
+        List<String> columns = jdbcTemplate.queryForList(
+                "select column_name from information_schema.columns "
+                        + "where table_schema = 'public' and table_name = 'tenants'",
+                String.class);
+
+        assertThat(columns).contains("api_key_hash");
+        // V4 dropped it. If this fails, the plaintext column is back.
+        assertThat(columns).doesNotContain("api_key");
+    }
+
+    @Test
+    void storedValueIsTheSha256HashAndNotTheKeyItself() {
+        String storedHash = jdbcTemplate.queryForObject(
+                "select api_key_hash from tenants where name = 'acme'", String.class);
+
+        // Matches the digest the auth path computes, and Postgres's own sha256() —
+        // which is what the V3 backfill used, so both producers agree.
+        assertThat(storedHash).isEqualTo(ApiKeyHasher.sha256Hex(ACME_KEY));
+        assertThat(storedHash).hasSize(64).matches("[0-9a-f]{64}");
+        assertThat(storedHash).isNotEqualTo(ACME_KEY);
+    }
+
+    @Test
+    void noPlaintextKeyAppearsAnywhereInTheTenantsTable() {
+        // Scan every text column of every row, not just the ones we expect — a dump of
+        // this table must not contain a usable credential.
+        List<java.util.Map<String, Object>> rows = jdbcTemplate.queryForList("select * from tenants");
+        assertThat(rows).isNotEmpty();
+
+        for (java.util.Map<String, Object> row : rows) {
+            for (Object value : row.values()) {
+                String text = String.valueOf(value);
+                assertThat(text).doesNotContain(ACME_KEY).doesNotContain(GLOBEX_KEY).doesNotContain(INITECH_KEY);
+            }
+        }
+    }
+
+    @Test
+    void hashingIsDeterministicAndKeySpecific() {
+        assertThat(ApiKeyHasher.sha256Hex(ACME_KEY)).isEqualTo(ApiKeyHasher.sha256Hex(ACME_KEY));
+        assertThat(ApiKeyHasher.sha256Hex(ACME_KEY)).isNotEqualTo(ApiKeyHasher.sha256Hex(GLOBEX_KEY));
+    }
+
     // ---- helpers ----
 
     private UUID tenantId(String apiKey) {
-        return tenantRepository.findByApiKey(apiKey).orElseThrow().getId();
+        return tenantByKey(apiKey).getId();
+    }
+
+    /** Resolves a tenant the way the auth path does: by the hash, never the plaintext. */
+    private Tenant tenantByKey(String apiKey) {
+        return tenantRepository.findByApiKeyHash(ApiKeyHasher.sha256Hex(apiKey)).orElseThrow();
     }
 
     private double counter(String name, String... tags) {

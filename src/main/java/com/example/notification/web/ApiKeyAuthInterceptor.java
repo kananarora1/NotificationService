@@ -1,5 +1,6 @@
 package com.example.notification.web;
 
+import com.example.notification.tenant.ApiKeyHasher;
 import com.example.notification.tenant.Tenant;
 import com.example.notification.tenant.TenantRepository;
 import jakarta.servlet.http.HttpServletRequest;
@@ -12,7 +13,8 @@ import java.util.Optional;
 
 /**
  * Identity gate for the notification endpoints (see {@code WebConfig} for the exact
- * paths). Requires an {@code X-API-Key} header, resolves it to a {@link Tenant}, and
+ * paths). Requires an {@code X-API-Key} header, resolves it to a {@link Tenant} by the
+ * SHA-256 hash of that key (the plaintext is never stored — see {@link ApiKeyHasher}), and
  * stashes the tenant as a request attribute for downstream use (rate limiting,
  * persisting tenant_id, scoping reads). A missing or unknown key is rejected with 401
  * before the controller runs. Applies to every HTTP method, reads included — the read
@@ -38,7 +40,10 @@ public class ApiKeyAuthInterceptor implements HandlerInterceptor {
             return false;
         }
 
-        Optional<Tenant> tenant = tenants.findByApiKey(apiKey);
+        // Hash first, then look up by hash: a single indexed lookup, same cost as the
+        // old plaintext one. The presented key is never compared against stored
+        // plaintext because none exists.
+        Optional<Tenant> tenant = tenants.findByApiKeyHash(ApiKeyHasher.sha256Hex(apiKey));
         if (tenant.isEmpty()) {
             response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
             return false;

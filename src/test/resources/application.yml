@@ -32,6 +32,23 @@ spring:
           multiplier: 2.0
           max-interval: 10000
 
+# src/test/resources/application.yml fully replaces the main one on the test classpath,
+# so the seeded tenants have to be declared here too. Same keys the docs and tests use;
+# only their SHA-256 hashes are stored.
+notifications:
+  seeding:
+    enabled: true
+    tenants:
+      - name: acme
+        api-key: key-acme
+        rate-limit-per-minute: 60
+      - name: globex
+        api-key: key-globex
+        rate-limit-per-minute: 10
+      - name: initech
+        api-key: key-initech
+        rate-limit-per-minute: 5
+
 management:
   endpoints:
     web:

@@ -18,6 +18,7 @@ See [Observability](#observability-v8).
 
 - Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis, Actuator)
 - PostgreSQL — source of truth (notifications + tenants), schema managed by Flyway
+- Config & secrets from the environment (`.env.example`); API keys stored SHA-256 hashed
 - RabbitMQ — message broker (with retries + dead-letter queue)
 - Redis — shared store for the distributed rate limiter
 - Micrometer + Prometheus + Grafana — metrics and dashboards
@@ -175,18 +176,28 @@ most once. Postgres remains the source of truth for "has this already been sent"
 ### Identity: the `X-API-Key` header
 
 `POST /notify` requires an **`X-API-Key`** header. The key is resolved to a
-**tenant** (table `tenants`: `id`, `name`, unique `apiKey`, `rateLimitPerMinute`).
-A missing or unknown key returns **`401 Unauthorized`** before the controller runs
-(enforced by a `HandlerInterceptor`). The resolving tenant's id is stored on every
-notification it creates (`tenant_id`). `GET /notify/{id}` is **not** gated.
+**tenant** (table `tenants`: `id`, `name`, unique `api_key_hash`,
+`rate_limit_per_minute`). A missing or unknown key returns **`401 Unauthorized`**
+before the controller runs (enforced by a `HandlerInterceptor`). The resolving
+tenant's id is stored on every notification it creates (`tenant_id`).
+`GET /notify/{id}` is **not** gated.
 
-Tenants are seeded at startup (idempotently, safe across instances):
+**The key itself is never stored** — only its SHA-256 hash. On each request the
+presented key is hashed and the tenant looked up by that hash, on a unique index. See
+[API key storage](#api-key-storage-sha-256-not-bcrypt).
 
-| tenant   | apiKey         | rateLimitPerMinute |
-|----------|----------------|--------------------|
-| acme     | `key-acme`     | 60                 |
-| globex   | `key-globex`   | 10                 |
-| initech  | `key-initech`  | 5                  |
+Tenants are seeded at startup (idempotently, safe across instances) from
+`notifications.seeding.*`, each key overridable by environment variable:
+
+| tenant   | key (local dev) | env var          | rateLimitPerMinute |
+|----------|-----------------|------------------|--------------------|
+| acme     | `key-acme`      | `ACME_API_KEY`   | 60                 |
+| globex   | `key-globex`    | `GLOBEX_API_KEY` | 10                 |
+| initech  | `key-initech`   | `INITECH_API_KEY`| 5                  |
+
+These are development keys, published here deliberately. In a deployed environment set
+`SEED_TENANTS_ENABLED=false` and provision tenants properly — see
+[Adding a tenant](#adding-a-tenant).
 
 ## Rate limiting: distributed (v7)
 
@@ -337,21 +348,28 @@ green.
 ## 1. Start the stack (Postgres + RabbitMQ + Redis + Prometheus + Grafana)
 
 ```bash
+cp .env.example .env    # first time only — then edit the passwords
 docker compose up -d
 ```
 
+`docker compose` reads `.env` from this directory automatically. Every port and
+credential below is a `.env` variable with a local-development fallback, so a bare
+`docker compose up -d` works without one.
+
 This starts:
 
-- **Postgres 16** on `localhost:5433` (host `5433` → container `5432`, to avoid
-  colliding with a native Postgres on `5432`). DB/user/password are all
-  `notifications`.
+- **Postgres 16** on `localhost:${POSTGRES_PORT:-5433}` (host → container `5432`, to
+  avoid colliding with a native Postgres on `5432`). Database `POSTGRES_DB`, user
+  `DB_USERNAME`, password `DB_PASSWORD` — all defaulting to `notifications`.
 - **RabbitMQ 3.13** with the management plugin: AMQP on `localhost:5672`, and the
-  management UI on **http://localhost:15672** (login **guest / guest**).
+  management UI on **http://localhost:15672** (login `RABBITMQ_USERNAME` /
+  `RABBITMQ_PASSWORD`, default **guest / guest**).
 - **Redis 7** on `localhost:6379` — the shared store for the distributed rate
   limiter. Inspect a bucket with
   `docker exec notification-redis redis-cli hgetall "ratelimit:<tenantId>"`.
 - **Prometheus** on **http://localhost:9090** — scrapes the app every 5s.
-- **Grafana** on **http://localhost:3000** (**admin / admin**) — pre-loaded with the
+- **Grafana** on **http://localhost:3000** (`GRAFANA_ADMIN_USER` /
+  `GRAFANA_ADMIN_PASSWORD`, default **admin / admin**) — pre-loaded with the
   Notification Service dashboard.
 
 > **Upgrading an existing broker:** v4 adds dead-letter arguments to the
@@ -362,12 +380,19 @@ This starts:
 ## 2. Run the app
 
 ```bash
+# load the secrets from .env into the environment, then start
+set -a; source .env; set +a
 ./mvnw spring-boot:run
 ```
 
-The app listens on `http://localhost:8080`. The DB schema is created/updated
-automatically (`spring.jpa.hibernate.ddl-auto=update`), and the queues/exchanges
-are declared on startup.
+Without `source .env` the app still starts: every setting falls back to the
+local-development default baked into `application.yml` (see
+[Configuration & secrets](#configuration--secrets)).
+
+The app listens on `http://localhost:8080` (`SERVER_PORT`). The schema is applied by
+**Flyway** on startup and verified by Hibernate (`ddl-auto: validate` — it never
+changes the schema); see [Database migrations](#database-migrations). The
+queues/exchanges are declared on startup.
 
 ## 3. Try the endpoints
 
@@ -483,6 +508,108 @@ underlying cause is permanent — e.g. `fail@example.com` — it will simply be
 dead-lettered again.) For a real system you'd typically fix the root cause first,
 then replay in bulk via the Shovel plugin or a small admin endpoint.
 
+## Configuration & secrets
+
+No credential is hardcoded. Every setting in `application.yml` is read from an
+environment variable with a **local-development fallback**:
+
+```yaml
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/notifications}
+    username: ${DB_USERNAME:notifications}
+    password: ${DB_PASSWORD:notifications}
+```
+
+The fallbacks are the docker-compose values — non-secret, and there so a fresh clone
+runs with `docker compose up -d && ./mvnw spring-boot:run`. **A deployed environment
+must set the variables explicitly**; the environment always wins over the default.
+
+[`.env.example`](.env.example) is the full list. Copy it and fill in real values:
+
+```bash
+cp .env.example .env
+```
+
+`.env` is gitignored and must never be committed. `docker compose` reads it from this
+directory automatically; to run the app on the host with the same values:
+
+```bash
+set -a; source .env; set +a
+./mvnw spring-boot:run
+```
+
+| variable | purpose | dev default |
+|---|---|---|
+| `DB_URL` | JDBC url | `jdbc:postgresql://localhost:5433/notifications` |
+| `DB_USERNAME` / `DB_PASSWORD` | Postgres credentials (also used to init the container) | `notifications` |
+| `POSTGRES_DB` / `POSTGRES_PORT` | container database name / host port | `notifications` / `5433` |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` | broker address | `localhost` / `5672` |
+| `RABBITMQ_USERNAME` / `RABBITMQ_PASSWORD` | broker credentials | `guest` |
+| `RABBITMQ_MANAGEMENT_PORT` | management UI port | `15672` |
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | rate-limiter store (password empty locally) | `localhost` / `6379` / — |
+| `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` / `GRAFANA_PORT` | Grafana login and port | `admin` / `admin` / `3000` |
+| `PROMETHEUS_PORT` | Prometheus port | `9090` |
+| `SERVER_PORT` | app HTTP port | `8080` |
+| `SEED_TENANTS_ENABLED` | seed the dev tenants on startup | `true` |
+| `ACME_API_KEY` / `GLOBEX_API_KEY` / `INITECH_API_KEY` | seeded tenants' keys | `key-acme` / `key-globex` / `key-initech` |
+| `ACME_RATE_LIMIT` / `GLOBEX_RATE_LIMIT` / `INITECH_RATE_LIMIT` | their per-minute budgets | `60` / `10` / `5` |
+
+`ConfigSecretsTest` enforces this: it fails the build if a credential stops being an
+environment placeholder, if a variable used by `application.yml` is missing from
+`.env.example`, or if `.env` stops being gitignored.
+
+### API key storage: SHA-256, not bcrypt
+
+API keys are stored as a **SHA-256 hash** (lowercase hex, column `api_key_hash`,
+unique-indexed). A client keeps sending the same `X-API-Key` it always did; only the
+storage changed. On each request the interceptor hashes the presented key and looks
+the tenant up by hash — one indexed lookup, the same cost as the old plaintext one.
+
+**Why not bcrypt/argon2?** They are *password* hashes, deliberately slow (a tunable
+work factor, ~100ms) to make brute-forcing low-entropy human-chosen passwords
+impractical. Neither property helps here:
+
+- **It is the hot path.** Every request authenticates. A 100ms KDF would dominate an
+  endpoint whose p99 is a few milliseconds, and would cap throughput at roughly
+  *threads ÷ 0.1s* requests per second. SHA-256 is well under a microsecond.
+- **API keys are generated, not chosen.** 256 bits from `SecureRandom` — there is no
+  dictionary to run and no feasible brute force, so the work factor buys nothing. The
+  reason to hash at all is narrower: a leaked database dump must not contain working
+  credentials.
+- **No salt, deliberately.** Lookup is *by* the hash, on an index. A per-key salt would
+  force a scan of every tenant row per request. Unsalted is safe precisely because the
+  input is high-entropy — rainbow tables cover human passwords, not 256-bit random
+  strings.
+
+The trade-off worth stating: SHA-256 gives no protection against a *weak* key, so keys
+must be generated, never chosen by a human.
+
+### Adding a tenant
+
+Generate a random key, give it to the client **once**, store only its hash:
+
+```bash
+# 1. Generate a 256-bit key (43 URL-safe base64 chars)
+API_KEY=$(openssl rand -base64 32 | tr -d '=+/' | cut -c1-43)
+echo "$API_KEY"          # hand this to the client now — it cannot be recovered later
+
+# 2. Compute its SHA-256, exactly as the app does
+API_KEY_HASH=$(printf '%s' "$API_KEY" | shasum -a 256 | cut -d' ' -f1)
+
+# 3. Insert the tenant, hash only
+docker exec notification-postgres psql -U "${DB_USERNAME:-notifications}" -d notifications \
+  -c "insert into tenants (id, name, api_key_hash, rate_limit_per_minute)
+      values (gen_random_uuid(), 'newco', '$API_KEY_HASH', 30);"
+```
+
+Postgres computes the identical digest itself, if you would rather not shell out:
+`encode(sha256(convert_to('<key>','UTF8')),'hex')` — that is exactly what the `V3`
+backfill used.
+
+**Rotating or revoking** a key is an `update` or `delete` on that row. Since the
+plaintext is unrecoverable, a lost key is re-issued, never looked up.
+
 ## Database migrations
 
 The schema is managed by **[Flyway](https://flywaydb.org/)**, not by Hibernate.
@@ -493,6 +620,8 @@ startup, before the JPA `EntityManagerFactory` is built.
 |---|---|
 | `V1__baseline_schema.sql` | The full schema — `notifications`, `tenants`, their constraints and indexes. |
 | `V2__tenant_scoped_list_indexes.sql` | Indexes for the tenant-scoped list queries. |
+| `V3__hash_api_keys.sql` | Adds `api_key_hash` (unique) and backfills it from the plaintext keys. |
+| `V4__drop_plaintext_api_key.sql` | Drops the plaintext `api_key` column. |
 
 ### `ddl-auto` is `validate`
 
@@ -524,6 +653,13 @@ underscore before the description. Then:
 2. Make the matching change to the JPA entity.
 3. Run `./mvnw test` — the tests build their schema from these same migrations, so
    a migration that disagrees with the entities fails there rather than in production.
+
+**Destructive changes go in two migrations.** `V3`/`V4` are the worked example: `V3`
+adds `api_key_hash`, backfills it and makes the old column nullable; `V4` drops the
+plaintext column. Splitting them means the backfill can be verified while the original
+data still exists, and an instance running the old code keeps working between the two
+(the expand/contract pattern). You can stop at the expand half with
+`--spring.flyway.target=3`.
 
 Two rules worth internalising:
 
@@ -596,6 +732,17 @@ docker exec notification-postgres psql -U notifications -d notifications \
   `ratelimit.rejected` with the right tenant tag; a dead-letter increments
   `notifications.dead`. (`@AutoConfigureObservability` enables the real Prometheus
   registry in the test — Spring Boot uses a `SimpleMeterRegistry` otherwise.)
+  **Hashed API keys (v9):** the existing keys still authenticate and resolve the right
+  tenant after the change; an unknown key is still `401`; the `tenants` table has **no**
+  `api_key` column once `V4` has run; the stored value is the SHA-256 of the key and
+  matches what Postgres's own `sha256()` produced in the `V3` backfill; and no column of
+  any tenant row contains a plaintext key.
+- `ConfigSecretsTest` — no Spring context, no containers. Reads the real
+  `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
+  being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented
+  in `.env.example`, if `.env` stops being gitignored, or if a `.env` is ever tracked.
+  It also exercises the placeholder itself: `ACME_API_KEY` set overrides the seeded key,
+  absent falls back to the development default.
 - `SimulatedProviderTest` — unit test for the stubbed provider.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the

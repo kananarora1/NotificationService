@@ -3,12 +3,15 @@ services:
     image: postgres:16
     container_name: notification-postgres
     environment:
-      POSTGRES_DB: notifications
-      POSTGRES_USER: notifications
-      POSTGRES_PASSWORD: notifications
-    # Host port is 5433 to avoid colliding with a native Postgres on 5432.
+      # Values come from .env, which docker compose reads from this directory
+      # automatically. The ":-" fallbacks keep a bare `docker compose up` working for
+      # local development; deployed environments must set them explicitly.
+      POSTGRES_DB: ${POSTGRES_DB:-notifications}
+      POSTGRES_USER: ${DB_USERNAME:-notifications}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-notifications}
+    # Host port defaults to 5433 to avoid colliding with a native Postgres on 5432.
     ports:
-      - "5433:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - notification-pgdata:/var/lib/postgresql/data
 
@@ -16,13 +19,13 @@ services:
     image: rabbitmq:3.13-management
     container_name: notification-rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
     ports:
       # AMQP protocol port
-      - "5672:5672"
-      # Management UI: http://localhost:15672 (guest/guest)
-      - "15672:15672"
+      - "${RABBITMQ_PORT:-5672}:5672"
+      # Management UI: http://localhost:15672
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
     volumes:
       - notification-rabbitmq:/var/lib/rabbitmq
 
@@ -31,7 +34,7 @@ services:
     container_name: notification-redis
     # Shared store for the distributed rate limiter (v7).
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - notification-redis:/data
 
@@ -40,7 +43,7 @@ services:
     container_name: notification-prometheus
     # Scrapes the app's /actuator/prometheus every 5s (see observability/prometheus/prometheus.yml).
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     extra_hosts:
@@ -52,10 +55,10 @@ services:
     container_name: notification-grafana
     # Auto-provisioned with the Prometheus datasource + a dashboard, so it works on first boot.
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_DEFAULT_THEME: light
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
