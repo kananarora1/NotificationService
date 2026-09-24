@@ -17,7 +17,7 @@ See [Observability](#observability-v8).
 ## Stack
 
 - Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis, Actuator)
-- PostgreSQL — source of truth (notifications + tenants)
+- PostgreSQL — source of truth (notifications + tenants), schema managed by Flyway
 - RabbitMQ — message broker (with retries + dead-letter queue)
 - Redis — shared store for the distributed rate limiter
 - Micrometer + Prometheus + Grafana — metrics and dashboards
@@ -482,6 +482,86 @@ The work queue's consumer will pick it up and retry from scratch. (If the
 underlying cause is permanent — e.g. `fail@example.com` — it will simply be
 dead-lettered again.) For a real system you'd typically fix the root cause first,
 then replay in bulk via the Shovel plugin or a small admin endpoint.
+
+## Database migrations
+
+The schema is managed by **[Flyway](https://flywaydb.org/)**, not by Hibernate.
+Migrations live in `src/main/resources/db/migration` and run automatically on
+startup, before the JPA `EntityManagerFactory` is built.
+
+| file | what it does |
+|---|---|
+| `V1__baseline_schema.sql` | The full schema — `notifications`, `tenants`, their constraints and indexes. |
+| `V2__tenant_scoped_list_indexes.sql` | Indexes for the tenant-scoped list queries. |
+
+### `ddl-auto` is `validate`
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+```
+
+**Hibernate never changes the schema.** It only checks, at startup, that the
+entities match what Flyway built, and fails fast if they have drifted — for
+example if you add a field to an entity and forget the migration. This replaces
+the old `ddl-auto: update`, which silently mutated the database to match the
+entities and left every environment's schema subtly different.
+
+### Adding a migration
+
+Create the next numbered file in `src/main/resources/db/migration`:
+
+```
+src/main/resources/db/migration/V3__add_notification_priority.sql
+```
+
+The naming is `V<version>__<description>.sql` — capital `V`, a **double**
+underscore before the description. Then:
+
+1. Write the DDL (`ALTER TABLE notifications ADD COLUMN priority varchar(255);`).
+2. Make the matching change to the JPA entity.
+3. Run `./mvnw test` — the tests build their schema from these same migrations, so
+   a migration that disagrees with the entities fails there rather than in production.
+
+Two rules worth internalising:
+
+- **Never edit an already-applied migration.** Flyway checksums each file; changing
+  one that has run makes validation fail on every environment that already applied
+  it. Fix forward with a new version instead.
+- **Never change the schema by editing `V1`.** It does not re-run on databases that
+  already exist (see below), so the change would reach only brand-new environments.
+
+### Why there is a baseline
+
+The schema predates Flyway: it was originally created by `ddl-auto: update`, so
+existing databases already had tables but no `flyway_schema_history`. The config
+handles both cases:
+
+```yaml
+spring:
+  flyway:
+    baseline-on-migrate: true
+    baseline-version: 1
+```
+
+- **An existing database** is stamped at version 1 on first run. `V1` is recorded as
+  already applied and is *not* re-executed — so no `CREATE TABLE` runs against live
+  data. Migrations from `V2` up are then applied normally.
+- **An empty database** (a fresh `docker compose up`, or a Testcontainers database in
+  the test suite) ignores baselining entirely and runs `V1` from scratch, building the
+  whole schema with no manual SQL.
+
+`V1` is a verbatim snapshot of the pre-Flyway schema, down to the Hibernate-generated
+constraint names on `tenants`, so both paths end up with an identical schema.
+
+To inspect what has been applied:
+
+```bash
+docker exec notification-postgres psql -U notifications -d notifications \
+  -c "select version, description, type, success from flyway_schema_history order by installed_rank;"
+```
 
 ## Tests
 

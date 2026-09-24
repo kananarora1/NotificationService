@@ -2,9 +2,17 @@
 # runtime by Testcontainers (@ServiceConnection); only the bits that differ from
 # those defaults live here.
 spring:
+  # Tests get their schema from Flyway too, exactly like production — so the
+  # migrations are exercised on every test run rather than only in deployment.
+  # The Testcontainers database starts empty, so V1 runs from scratch (no baselining).
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
   jpa:
     hibernate:
-      ddl-auto: create-drop
+      # validate, not create-drop: the entities are checked against the
+      # Flyway-built schema. A migration that drifts from the entities fails the tests.
+      ddl-auto: validate
     open-in-view: false
   data:
     redis:
