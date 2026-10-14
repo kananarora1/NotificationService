@@ -109,10 +109,6 @@ public class Notification {
         this.attempts = 0;
     }
 
-    public void markFailed() {
-        this.status = NotificationStatus.FAILED;
-    }
-
     public UUID getId() {
         return id;
     }

@@ -48,7 +48,6 @@ while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKey`, and
 | `SENDING` | claimed by one consumer under a lease, provider call in flight       |
 | `SENT`    | delivered successfully                                               |
 | `DEAD`    | permanently failed: retries exhausted and the message dead-lettered  |
-| `FAILED`  | legacy single-attempt failure; retained but no longer set in v4      |
 
 Delivery is handled by `SimulatedProvider`: it sleeps ~800ms to mimic a slow
 external API, logs `sent to {recipient} via {channel}`, and returns success. It
@@ -892,6 +891,7 @@ startup, before the JPA `EntityManagerFactory` is built.
 | `V4__drop_plaintext_api_key.sql` | Drops the plaintext `api_key` column. |
 | `V5__sending_lease.sql` | Adds the SENDING lease: `claim_token`, `claimed_at`, partial index for the sweep. |
 | `V6__published_at.sql` | Adds `published_at` and a partial index for unpublished `PENDING` rows. |
+| `V7__drop_failed_status.sql` | Narrows the status `CHECK` to `PENDING`/`SENDING`/`SENT`/`DEAD`; aborts if any row is still `FAILED`. |
 
 ### `ddl-auto` is `validate`
 
@@ -1018,7 +1018,9 @@ docker exec notification-postgres psql -U notifications -d notifications \
   still answers `202`, the row is `PENDING` with no message, a same-key retry answers
   `200 PENDING`, and the reconciler republishes it to `SENT` with one provider call; a
   normal POST records `published_at`; republishing an id whose message is already queued
-  leaves two copies on the queue and still delivers once.
+  leaves two copies on the queue and still delivers once. **Statuses:** the enum is
+  exactly `PENDING`/`SENDING`/`SENT`/`DEAD`, the `CHECK` constraint allows exactly those,
+  and writing `FAILED` is rejected.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

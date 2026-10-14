@@ -41,6 +41,7 @@ import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -79,8 +80,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -1031,6 +1034,33 @@ class NotificationIntegrationTest {
         await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(3))
                 .until(() -> provider.invocationTimes(id).size() == 1);
         assertThat(counter("notifications.republished")).isGreaterThanOrEqualTo(republishedBefore + 1);
+    }
+
+    // ---- v11: FAILED removed ----
+
+    @Test
+    void failedStatusIsGoneFromTheEnumAndTheSchema() {
+        assertThat(NotificationStatus.values()).containsExactly(
+                NotificationStatus.PENDING, NotificationStatus.SENDING, NotificationStatus.SENT, NotificationStatus.DEAD);
+
+        // The CHECK constraint (V7) allows exactly the enum's values.
+        String check = jdbcTemplate.queryForObject(
+                "select pg_get_constraintdef(oid) from pg_constraint where conname = 'notifications_status_check'",
+                String.class);
+        List<String> allowed = Pattern.compile("'([A-Z]+)'").matcher(check).results().map(m -> m.group(1)).toList();
+        assertThat(allowed).containsExactlyInAnyOrder(
+                Arrays.stream(NotificationStatus.values()).map(Enum::name).toArray(String[]::new));
+
+        Notification n = new Notification("check@example.com", Channel.EMAIL, "constraint");
+        repository.save(n);
+        try {
+            assertThatThrownBy(() -> jdbcTemplate.update(
+                    "update notifications set status = 'FAILED' where id = ?", n.getId()))
+                    .isInstanceOf(DataIntegrityViolationException.class);
+            assertThat(repository.findById(n.getId()).orElseThrow().getStatus()).isEqualTo(NotificationStatus.PENDING);
+        } finally {
+            repository.deleteById(n.getId()); // never published; keep it away from the reconciler
+        }
     }
 
     // ---- helpers ----

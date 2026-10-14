@@ -120,7 +120,7 @@ public class NotificationService {
      * once per retry attempt. Claims a lease, calls the provider, and marks SENT on
      * success.
      *
-     * <p>On a provider failure the claim is released (back to PENDING, not FAILED) and
+     * <p>On a provider failure the claim is released (back to PENDING) and
      * the exception is <b>rethrown</b> so the listener's retry interceptor can back off
      * and retry. When retries are finally exhausted the message is dead-lettered and
      * {@link #markDead(UUID, String)} flips it to DEAD.
