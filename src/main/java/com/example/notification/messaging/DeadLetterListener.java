@@ -1,8 +1,6 @@
 package com.example.notification.messaging;
 
 import com.example.notification.service.NotificationService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
@@ -20,8 +18,6 @@ import java.util.UUID;
 @Component
 public class DeadLetterListener {
 
-    private static final Logger log = LoggerFactory.getLogger(DeadLetterListener.class);
-
     private final NotificationService service;
 
     public DeadLetterListener(NotificationService service) {
@@ -31,10 +27,7 @@ public class DeadLetterListener {
     @RabbitListener(queues = RabbitConfig.DEAD_LETTER_QUEUE)
     public void onDeadLetter(String notificationId,
                              @Header(name = "x-death", required = false) List<Map<String, ?>> xDeath) {
-        UUID id = UUID.fromString(notificationId);
-        String reason = describe(xDeath);
-        int attempts = service.markDead(id, reason);
-        log.warn("Notification {} dead-lettered after {} attempts: {}", id, attempts, reason);
+        service.markDead(UUID.fromString(notificationId), describe(xDeath));
     }
 
     /** Builds a short human-readable reason from RabbitMQ's x-death header, if present. */

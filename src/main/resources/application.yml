@@ -1,6 +1,13 @@
 spring:
   application:
     name: notification-service
+  task:
+    scheduling:
+      pool:
+        # Two threads, not Boot's default of one: MetricsPoller and LeaseReconciler are
+        # both @Scheduled. On one thread a hung sweep would also freeze the gauges —
+        # including notifications.stuck_sending, the one that detects a hung sweep.
+        size: 2
   lifecycle:
     # Budget for EACH SmartLifecycle shutdown phase (the web server's drain and the
     # RabbitMQ listener's drain are separate phases, so worst case is roughly two of
@@ -76,6 +83,15 @@ notifications:
     # How long the RabbitMQ listener containers may spend draining in-flight and
     # prefetched messages on shutdown. Keep below timeout-per-shutdown-phase (30s).
     shutdown-timeout: ${LISTENER_SHUTDOWN_TIMEOUT:25s}
+  reconciler:
+    # A SENDING claim older than this is presumed abandoned (its consumer died) and is
+    # returned to PENDING and republished. It covers one provider call, not the retry
+    # cycle, so it only has to clear the slowest single send (~800ms here) with margin.
+    lease-timeout: ${RECONCILER_LEASE_TIMEOUT:60s}
+    # Fixed delay between sweeps. ISO-8601 (PT30S) or plain milliseconds: @Scheduled in
+    # Spring 6.1 does not accept the "30s" shorthand the other durations here use.
+    sweep-interval: ${RECONCILER_SWEEP_INTERVAL:PT30S}
+    batch-size: 100
   seeding:
     # Local-development convenience: ensures these tenants exist on startup, storing
     # only the SHA-256 hash of each key. Set SEED_TENANTS_ENABLED=false in production

@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -23,6 +24,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>{@code flaky@example.com} — throws on the first two attempts for a given
  *       notification, then succeeds (transient failure → recovers to SENT via retry).</li>
  * </ul>
+ *
+ * <p>Idempotent on the notification id, as {@link NotificationProvider} requires: once an
+ * id has been delivered, a repeat send of it is acknowledged without delivering again —
+ * which is how a real provider treats a repeated idempotency key. That is what keeps the
+ * reconciler's at-least-once retries from reaching the recipient twice.
  */
 @Component
 public class SimulatedProvider implements NotificationProvider {
@@ -40,6 +46,12 @@ public class SimulatedProvider implements NotificationProvider {
 
     /** Wall-clock timestamps of each send() invocation per notification (for backoff assertions). */
     private final ConcurrentHashMap<UUID, List<Long>> invocationTimes = new ConcurrentHashMap<>();
+
+    /** Ids delivered so far: the provider-side record that makes a repeat send a no-op. */
+    private final Set<UUID> delivered = ConcurrentHashMap.newKeySet();
+
+    /** Per-notification count of repeat sends that were acknowledged without delivering. */
+    private final ConcurrentHashMap<UUID, AtomicInteger> duplicatesIgnored = new ConcurrentHashMap<>();
 
     @Override
     public void send(Notification notification) {
@@ -68,6 +80,12 @@ public class SimulatedProvider implements NotificationProvider {
             }
         }
 
+        // Atomic check-and-record, so two concurrent sends of one id still deliver once.
+        if (!delivered.add(notification.getId())) {
+            duplicatesIgnored.computeIfAbsent(notification.getId(), k -> new AtomicInteger()).incrementAndGet();
+            log.info("already delivered {}; acknowledging the repeat send without delivering", notification.getId());
+            return;
+        }
         log.info("sent to {} via {}", recipient, notification.getChannel());
     }
 
@@ -75,6 +93,17 @@ public class SimulatedProvider implements NotificationProvider {
         invocationTimes
                 .computeIfAbsent(id, k -> Collections.synchronizedList(new ArrayList<>()))
                 .add(System.currentTimeMillis());
+    }
+
+    /** Whether this notification has actually been delivered (not merely attempted). */
+    public boolean wasDelivered(UUID id) {
+        return delivered.contains(id);
+    }
+
+    /** How many repeat sends of an already-delivered notification were ignored. */
+    public int duplicatesIgnored(UUID id) {
+        AtomicInteger count = duplicatesIgnored.get(id);
+        return count == null ? 0 : count.get();
     }
 
     /** Returns a snapshot of the send() invocation timestamps for a notification. */

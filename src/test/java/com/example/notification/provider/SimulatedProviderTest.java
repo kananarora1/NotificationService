@@ -28,6 +28,27 @@ class SimulatedProviderTest {
     }
 
     @Test
+    void repeatSendOfTheSameIdIsAcknowledgedWithoutDeliveringAgain() {
+        Notification notification = new Notification("once@example.com", Channel.EMAIL, "hi");
+
+        provider.send(notification);
+        assertThatCode(() -> provider.send(notification)).doesNotThrowAnyException();
+
+        assertThat(provider.invocationTimes(notification.getId())).hasSize(2);
+        assertThat(provider.wasDelivered(notification.getId())).isTrue();
+        assertThat(provider.duplicatesIgnored(notification.getId())).isEqualTo(1);
+    }
+
+    @Test
+    void failedSendIsNotRecordedAsDelivered() {
+        Notification notification = new Notification("fail@example.com", Channel.EMAIL, "boom");
+
+        assertThatThrownBy(() -> provider.send(notification)).isInstanceOf(RuntimeException.class);
+
+        assertThat(provider.wasDelivered(notification.getId())).isFalse();
+    }
+
+    @Test
     void sendBlocksForTheSimulatedLatency() {
         Notification notification = new Notification("+15551234567", Channel.SMS, "hi");
 

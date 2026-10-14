@@ -36,6 +36,14 @@ spring:
 # so the seeded tenants have to be declared here too. Same keys the docs and tests use;
 # only their SHA-256 hashes are stored.
 notifications:
+  reconciler:
+    # Production lease, so nothing a test has genuinely in flight is ever reclaimed;
+    # tests expire a lease by backdating claimed_at instead of waiting 60s.
+    lease-timeout: 60s
+    # Fast sweep, so a test that expires a lease sees the scheduled reconciler act
+    # within a second rather than calling it by hand.
+    sweep-interval: PT1S
+    batch-size: 100
   seeding:
     enabled: true
     tenants:

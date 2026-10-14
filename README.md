@@ -5,8 +5,12 @@ as the source of truth. `POST /notify` saves the notification as `PENDING`,
 publishes its id to a durable queue, and returns `202 Accepted` immediately. A
 pool of `@RabbitListener` consumers drains the queue and performs delivery, with
 **retries + backoff** and a **dead-letter queue** for permanent failures (v4),
-**idempotency** for an at-most-once send (v5), **tenant identity via API keys**
-(v6), and a **Redis-backed distributed rate limiter** (v7).
+**idempotency** against duplicate requests and redeliveries (v5), **tenant identity
+via API keys** (v6), and a **Redis-backed distributed rate limiter** (v7).
+
+A **lease reconciler** (v10) recovers notifications whose consumer died mid-delivery,
+so a crash can delay a send but never strand it. See
+[Crash recovery: leases and the reconciler](#crash-recovery-leases-and-the-reconciler-v10).
 
 v8 adds **observability** — no new features, just visibility into what already
 exists. The app exports Micrometer metrics (custom business counters/timers/gauges
@@ -29,14 +33,16 @@ See [Observability](#observability-v8).
 A `Notification` has: `id` (UUID), `tenantId` (the API-key tenant that created it),
 `recipient`, `channel` (`EMAIL`/`SMS`/`PUSH`), `message`, `status`, `attempts` (int),
 a nullable `failureReason`, a nullable and **UNIQUE** `idempotencyKey`, `createdAt`,
-and a nullable `sentAt`. A `Tenant` has: `id`, `name`, unique `apiKey`, and
+a nullable `sentAt`, and the delivery lease `claimToken` / `claimedAt` (both set only
+while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKey`, and
 `rateLimitPerMinute`.
 
 `status` is one of:
 
 | status    | meaning                                                              |
 |-----------|---------------------------------------------------------------------|
-| `PENDING` | accepted, awaiting (or undergoing) delivery — including retries      |
+| `PENDING` | accepted, awaiting delivery — including between retries              |
+| `SENDING` | claimed by one consumer under a lease, provider call in flight       |
 | `SENT`    | delivered successfully                                               |
 | `DEAD`    | permanently failed: retries exhausted and the message dead-lettered  |
 | `FAILED`  | legacy single-attempt failure; retained but no longer set in v4      |
@@ -50,6 +56,11 @@ failure paths so they are testable on demand:
   retries are exhausted).
 - **`flaky@example.com`** — throws on the first two attempts for a given
   notification, then succeeds (transient failure → recovers to `SENT` via retry).
+
+`SimulatedProvider` is also **idempotent on the notification id**: a repeat send of an
+id it has already delivered is acknowledged without delivering again (logged as
+`already delivered {id}`). Every provider must behave this way — see
+[the double-send contract](#the-double-send-contract).
 
 ## Architecture (v4)
 
@@ -120,8 +131,12 @@ routes it to `notifications.dlq`.
 
 ## Idempotency
 
-v5 guarantees an **at-most-once send** by defending against two independent
-duplicate sources.
+Two independent duplicate sources are defended against: client retries (one row per
+key) and broker redeliveries (one provider call per claim). Together with the
+[lease reconciler](#crash-recovery-leases-and-the-reconciler-v10), delivery is
+**at-least-once with an idempotent provider** — every accepted notification is sent,
+and the provider absorbs the rare repeat. It is *not* at-most-once: a crash after the
+provider accepted a notification but before `SENT` was recorded causes one retry.
 
 ### Caller-level: the `Idempotency-Key` header
 
@@ -161,15 +176,76 @@ the `try`, not later at commit.)
 ### Processing-level: redelivery-safe consumer
 
 RabbitMQ is at-least-once: a message can be redelivered (consumer crash before ack,
-connection drop, etc.). Before calling the provider, the consumer checks the row's
-status:
+connection drop, etc.), and a redelivery can race the original. Before calling the
+provider, the consumer **claims** the row with one conditional UPDATE
+(`PENDING -> SENDING ... WHERE status = 'PENDING'`):
 
-- status `PENDING` → deliver (and on success mark `SENT`).
-- status `SENT` or `DEAD` → **skip the provider call**, log
-  `skipping already-processed {id}`, and ack.
+- claim won → deliver, then mark `SENT`.
+- claim lost (row is `SENDING` on another consumer, or already `SENT`/`DEAD`) →
+  **skip the provider call**, log `skipping …`, and ack.
 
-So even if the same message is processed twice, the slow `provider.send()` runs at
-most once. Postgres remains the source of truth for "has this already been sent".
+Of two concurrent copies of one message, exactly one reaches the provider. A failed
+attempt releases the claim (`SENDING -> PENDING`) so the listener's retry can win it
+again.
+
+## Crash recovery: leases and the reconciler (v10)
+
+**The problem.** A claim that is never finished — the consumer is `kill -9`ed, OOMs, or
+hits a DB error between the claim and the `SENT` write — used to leave the row in
+`SENDING` **forever**: the broker's redelivery lost the claim, skipped, and acked, and
+nothing else ever looked at the row. Measured before this change: 30 notifications
+posted, JVM killed 1s in, restarted — 16 rows were still `SENDING` 100s later with an
+empty queue, and would have stayed that way.
+
+**The lease.** The claim now also stamps `claim_token` (a fresh UUID per attempt) and
+`claimed_at` (`now()` — the *database* clock, so every instance measures expiry against
+the same clock). Every write after the claim is conditional on the token:
+
+| write | guarded by | if it matches no row |
+|---|---|---|
+| `SENDING -> SENT` | `status = 'SENDING' AND claim_token = ?` | lease was reclaimed: log, write nothing, ack |
+| `SENDING -> PENDING` (release after a failure) | same | lease was reclaimed: log, drop this copy (no retry) |
+| `PENDING -> DEAD` (from the DLQ) | `status = 'PENDING'` | another delivery claimed or finished it: log, ignore |
+
+So a consumer whose lease was taken away can never overwrite what happened next — in
+particular, a late dead-letter can no longer turn a `SENT` row into `DEAD`.
+
+**The reconciler.** `LeaseReconciler` runs every `sweep-interval` (30s). In one short
+transaction it locks up to `batch-size` (100) `SENDING` rows whose lease is older than
+`lease-timeout` (60s) with `SELECT … FOR UPDATE SKIP LOCKED` (so several instances
+never fight over a row), returns them to `PENDING`, and **republishes their ids before
+committing** — if the sweep fails, the rows stay `SENDING` and the next sweep retries,
+so it can never leave a `PENDING` row with no message. Rows stranded before V5 have no
+lease at all and are reclaimed on the first sweep. Each reclaim increments
+`notifications.reclaimed` and logs a `WARN`.
+
+The lease covers **one** provider call, not the retry cycle (the claim is released
+between retries), so 60s only has to beat the slowest single send. Worst-case delay
+for a crashed send is `lease-timeout + sweep-interval` ≈ 90s.
+
+Measured after this change, same procedure (30 posted, `kill -9` at 1s, restart): the
+16 redeliveries were skipped while the leases were live, the leases expired 60s after
+the claim, the next sweep reclaimed all 16, and all 30 were `SENT` 77s after posting —
+the 16 recovered rows with `attempts = 2`.
+
+### The double-send contract
+
+Reclaiming trades a possible **double-send** for a guaranteed eventual send. If the
+provider had already accepted the notification before its consumer died (or a send ran
+longer than the lease), the reclaimed retry calls the provider **again** for the same
+id. That is deliberate. It is safe only because:
+
+- **Every `NotificationProvider` must be idempotent on `notification.getId()`.** A
+  repeat call for a delivered id must succeed without delivering again. For a real
+  provider, pass the notification id as its idempotency key (most email/SMS APIs take
+  one); otherwise record delivered ids before acknowledging. `SimulatedProvider` does
+  the latter.
+- **Provider calls must time out well below `lease-timeout`**, so a slow send fails and
+  retries rather than being reclaimed underneath itself.
+
+**Not covered here** (separate fixes): a row committed as `PENDING` whose publish
+failed, and a dead-letter whose `DEAD` write keeps failing until the DLQ drops it, both
+still leave a `PENDING` row with no message. The reconciler only reclaims `SENDING`.
 
 ## Tenants, API keys & rate limiting (v6)
 
@@ -293,9 +369,12 @@ Custom business metrics added in v8:
 | `notifications.delivery.latency` | timer | — | duration of a `provider.send()` call |
 | `notifications.end_to_end.latency` | timer | — | accepted (`createdAt`) → sent (`sentAt`) |
 | `notifications.pending` | gauge | — | rows in PENDING status |
+| `notifications.sending` | gauge | — | rows in SENDING status (claimed, in flight) |
+| `notifications.stuck_sending` | gauge | — | SENDING rows past their lease, awaiting the reconciler |
+| `notifications.reclaimed` | counter | — | stranded SENDING rows returned to PENDING and republished (registered at 0 on startup) |
 | `queue.depth` | gauge | queue | RabbitMQ messages in `notifications.send` / `.dlq` |
 
-The two gauges are refreshed by a scheduled poller every 5s and cached, so a
+The gauges are refreshed by a scheduled poller every 5s and cached, so a
 Prometheus scrape never triggers a `COUNT(*)` on a large table or a broker
 round-trip. Per-tenant metrics are tagged with the tenant **name** (e.g. `acme`).
 
@@ -594,6 +673,8 @@ without it. `prometheus.yml` has a commented `alerting:` block if you want to ad
 | **DeadLetterQueueNotDraining** `critical` | `notifications.dlq` depth > 0 for 5m | `DeadLetterListener` is stuck or down, so failures are no longer being recorded as `DEAD`. Check the app logs and `rabbitmqctl list_queues name messages consumers`. |
 | **PendingBacklogHigh** `warning` | `notifications_pending > 100` for 5m | Consumers are behind. Check `queue_depth` for the work queue, that instances are alive, and whether the provider slowed down. |
 | **HighErrorRate** `warning` | failed attempts > 0.2/s for 5m | Retries may still recover these, but sustained failure leads to dead-letters. Check provider health and the recurring exception. |
+| **StuckSendingNotRecovered** `critical` | `max(notifications_stuck_sending) > 0` for 3m | Rows are past their lease but the reconciler is not reclaiming them, so they will never send. Look for `LeaseReconciler` errors (a failing sweep logs at `ERROR` each interval). |
+| **SendingLeasesReclaimedContinuously** `warning` | reclaim rate > 0 for 15m | One crash causes one burst, which is normal. A sustained rate means consumers keep dying, or sends outlive the lease (duplicate sends absorbed only by provider idempotency). Check restarts/OOMs and delivery latency vs `lease-timeout`. |
 | **TargetDown** `critical` | `up == 0` for 1m | An instance stopped being scraped. If it is the only one, the service is down. |
 | **RateLimitRejectionsSpike** `warning` | a tenant's 429 rate > 1/s for 5m | Decide: abuse (a client retrying without honouring `Retry-After`) or a tenant that needs a bigger `rate_limit_per_minute`. |
 | **HighEndToEndLatencyP99** `warning` | p99 submit→deliver > 5s for 10m | Compare against `notifications_delivery_latency_seconds`. If provider time is flat, the latency is queueing — check the backlog. |
@@ -850,6 +931,13 @@ docker exec notification-postgres psql -U notifications -d notifications \
   `api_key` column once `V4` has run; the stored value is the SHA-256 of the key and
   matches what Postgres's own `sha256()` produced in the `V3` backfill; and no column of
   any tenant row contains a plaintext key.
+  **Crash recovery (v10):** a row claimed and then abandoned (the crash) is reclaimed
+  by the scheduled reconciler, republished and `SENT` with exactly one provider call,
+  and `notifications.reclaimed` increments; a stale lease holder's `SENT` and release
+  writes match no row once its lease has been reclaimed; a consumer that delivers and
+  then hangs past its lease drops its late result without touching the new holder's
+  `SENT` (provider called twice, delivered once); a redelivery of a `SENT` row is still
+  skipped; and a late dead-letter cannot overwrite `SENT`.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

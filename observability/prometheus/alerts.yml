@@ -142,6 +142,58 @@ groups:
             that is flat, the time is being spent queued, so check notifications_pending
             and consumer health.
 
+      # ---- 8. Stranded SENDING rows are not being recovered. ----
+      #
+      # notifications_stuck_sending counts SENDING rows past their lease — rows whose
+      # consumer died mid-delivery. LeaseReconciler returns them to PENDING every sweep
+      # (30s), so the gauge should fall back to 0 within a sweep of any crash. Holding
+      # above 0 means the reconciler itself is not running or its sweep is failing, and
+      # those notifications will never be sent.
+      #
+      # max(), not sum(): every instance reports the same table-wide count, so summing
+      # would multiply it by the number of instances.
+      #
+      # TUNE: for: 3m = six missed sweeps at the 30s default. Scale with sweep-interval.
+      - alert: StuckSendingNotRecovered
+        expr: max(notifications_stuck_sending) > 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Notifications stuck in SENDING are not being reclaimed"
+          description: >-
+            {{ $value | printf "%.0f" }} notification(s) have sat in SENDING past their
+            lease for over 3 minutes. The reconciler should have returned them to PENDING.
+            Responder: check the logs for LeaseReconciler errors (a failing sweep logs at
+            ERROR every interval) and that the scheduler thread is alive.
+
+      # ---- 9. Leases keep expiring: consumers are dying or sends outlive the lease. ----
+      #
+      # One crash produces one burst of reclaims, which the reconciler handles — that is
+      # the design working, not an incident, and rate() over 5m lets a single burst age
+      # out before for: 15m elapses. A rate that stays above zero for 15 minutes means
+      # leases are expiring continuously: consumers crash-looping, or provider calls
+      # running longer than lease-timeout. The second case causes DUPLICATE sends that
+      # only the provider's idempotency absorbs.
+      #
+      # notifications_reclaimed_total is registered at 0 on startup, so rate() is
+      # accurate from the first scrape (no counter-birth blind spot).
+      #
+      # TUNE: > 0 for 15m. Any sustained reclaiming is abnormal at this scale.
+      - alert: SendingLeasesReclaimedContinuously
+        expr: sum(rate(notifications_reclaimed_total[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SENDING leases are being reclaimed continuously"
+          description: >-
+            Expired SENDING leases have been reclaimed at {{ $value | printf "%.3f" }}/s
+            for 15 minutes. Each one is a delivery whose consumer died or whose provider
+            call outlived the lease, and is retried — possibly as a duplicate send.
+            Responder: look for consumer restarts/OOMs, and compare
+            notifications_delivery_latency_seconds against the lease timeout.
+
   - name: notification-service-availability
     rules:
 

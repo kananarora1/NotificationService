@@ -2,6 +2,7 @@ package com.example.notification.metrics;
 
 import com.example.notification.tenant.Tenant;
 import com.example.notification.tenant.TenantRepository;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
 
@@ -22,10 +23,17 @@ public class NotificationMetrics {
     private final MeterRegistry registry;
     private final TenantRepository tenants;
     private final ConcurrentHashMap<UUID, String> tenantNameCache = new ConcurrentHashMap<>();
+    private final Counter reclaimed;
 
     public NotificationMetrics(MeterRegistry registry, TenantRepository tenants) {
         this.registry = registry;
         this.tenants = tenants;
+        // Registered up front, so the series exists at 0 from startup. A counter created
+        // on first increment is born at its full value, which rate()/increase() read as
+        // no change — the blind spot described on DeadLetterGrowing in alerts.yml.
+        this.reclaimed = Counter.builder("notifications.reclaimed")
+                .description("SENDING rows whose lease expired, returned to PENDING and republished")
+                .register(registry);
     }
 
     /** A notification was accepted and created (not a deduplicated duplicate). */
@@ -46,6 +54,11 @@ public class NotificationMetrics {
     /** A notification was dead-lettered (retries exhausted). */
     public void dead(String tenant) {
         registry.counter("notifications.dead", "tenant", tenant).increment();
+    }
+
+    /** The reconciler returned stranded SENDING rows to PENDING and republished them. */
+    public void reclaimed(int count) {
+        reclaimed.increment(count);
     }
 
     /** A request was rejected by the rate limiter (429). */

@@ -1,6 +1,7 @@
 package com.example.notification.service;
 
 import com.example.notification.domain.Notification;
+import com.example.notification.domain.NotificationStatus;
 import com.example.notification.messaging.NotificationPublisher;
 import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.provider.NotificationProvider;
@@ -87,8 +88,8 @@ public class NotificationService {
 
     /**
      * Attempts to deliver a single notification. Invoked by the RabbitMQ listener,
-     * once per retry attempt. Increments the attempt counter, calls the provider,
-     * and marks SENT on success.
+     * once per retry attempt. Claims a lease, calls the provider, and marks SENT on
+     * success.
      *
      * <p>On a provider failure the claim is released (back to PENDING, not FAILED) and
      * the exception is <b>rethrown</b> so the listener's retry interceptor can back off
@@ -97,35 +98,50 @@ public class NotificationService {
      *
      * <p>Processing idempotency: delivery is gated by an atomic PENDING -> SENDING
      * claim, so a row that is already terminal (SENT/DEAD) or in flight on another
-     * consumer is skipped without calling the provider. That makes a redelivery safe
-     * even when it races the original delivery rather than following it.
+     * consumer is skipped without calling the provider.
+     *
+     * <p>The claim is a <b>lease</b>, not a lock held forever. If this consumer dies
+     * anywhere between the claim and the SENT write, {@code LeaseReconciler} returns
+     * the row to PENDING once the lease expires and republishes it. That makes delivery
+     * at-least-once: the provider may already have accepted the notification before the
+     * crash, so it can be sent again — which is why {@link NotificationProvider} must be
+     * idempotent on the notification id. In exchange, nothing is stranded in SENDING.
+     *
+     * <p>Every write after the claim is conditional on this attempt's lease token. If
+     * one matches no row, the lease was reclaimed while this attempt was running (it
+     * outlived the lease timeout): the row now belongs to the consumer that claimed it
+     * next, so this attempt logs, writes nothing and acks.
      */
     public void attemptDelivery(UUID id) {
         // Atomic claim: PENDING -> SENDING in one conditional UPDATE, so of two
         // concurrent redeliveries exactly one proceeds to the provider. This is its
         // own short transaction and commits before the (slow) send below runs.
-        if (repository.claimForSending(id) == 0) {
+        UUID token = UUID.randomUUID();
+        if (repository.claimForSending(id, token) == 0) {
             Notification current = repository.findById(id).orElse(null);
             if (current == null) {
                 // The id was published but the row is gone (e.g. wiped between tests).
                 log.warn("No notification found for published id {}; skipping", id);
+            } else if (current.getStatus() == NotificationStatus.SENDING) {
+                // In flight on another consumer — or stranded by one that died. Either
+                // way it is not ours: the reconciler recovers it if the lease expires.
+                log.info("skipping {}: already claimed (lease since {})", id, current.getClaimedAt());
             } else {
-                // SENT/DEAD, or another consumer holds the claim. Ack without resending.
+                // SENT/DEAD. Ack without resending.
                 log.info("skipping already-processed {} (status {})", id, current.getStatus());
             }
             return;
         }
 
-        // Read AFTER the claim so the in-memory copy carries SENDING; reading first
-        // would make the merge below write the stale PENDING back over the claim.
+        // Read AFTER the claim, for the provider and the metrics only. Never saved back:
+        // all writes from here on are guarded UPDATEs, so this copy cannot overwrite them.
         Notification notification = repository.findById(id).orElse(null);
         if (notification == null) {
             log.warn("No notification found for published id {}; skipping", id);
             return;
         }
 
-        int attempt = notification.incrementAttempts();
-        repository.save(notification);
+        int attempt = notification.getAttempts(); // incremented by the claim itself
         log.info("Delivery attempt {} for notification {}", attempt, id);
 
         String tenant = metrics.tenantName(notification.getTenantId());
@@ -138,31 +154,49 @@ public class NotificationService {
             // Release the claim (SENDING -> PENDING) before rethrowing: the listener's
             // retry re-enters this method and must be able to win the claim again.
             // Without this every retry would skip and the message would never be
-            // dead-lettered. A crash here instead leaves the row stuck in SENDING.
-            repository.releaseClaim(id);
+            // dead-lettered. A crash here instead leaves the row in SENDING until the
+            // lease expires and the reconciler recovers it.
+            if (repository.releaseClaim(id, token) == 0) {
+                // The reconciler already reclaimed and republished it, so another copy of
+                // the message owns delivery now. Retrying this one would only compete.
+                log.warn("Lease on {} was reclaimed during failed attempt {}; dropping this copy",
+                        id, attempt, e);
+                return;
+            }
             throw e;
         }
         metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
 
         Instant sentAt = Instant.now();
-        notification.markSent(sentAt);
-        repository.save(notification);
+        if (repository.markSent(id, token, sentAt) == 0) {
+            // The send outlived the lease and the row was reclaimed: the next holder will
+            // send again (the provider dedupes on the id) and records SENT itself.
+            log.warn("Lease on {} was reclaimed before attempt {} could record SENT; "
+                    + "leaving the row to its new holder", id, attempt);
+            return;
+        }
 
         metrics.sent(tenant, notification.getChannel().name());
         metrics.recordEndToEndLatency(Duration.between(notification.getCreatedAt(), sentAt));
     }
 
     /**
-     * Marks a notification permanently failed after it has been dead-lettered.
-     * Returns the recorded attempt count for logging.
+     * Marks a notification permanently failed after it has been dead-lettered. Only a
+     * PENDING row qualifies (see {@link NotificationRepository#markDead}): if another
+     * delivery has since claimed or completed it, the late dead-letter is logged and
+     * ignored rather than overwriting that outcome.
      */
-    public int markDead(UUID id, String reason) {
-        Notification notification = repository.findById(id)
+    public void markDead(UUID id, String reason) {
+        if (repository.markDead(id, reason) == 0) {
+            Notification current = repository.findById(id)
+                    .orElseThrow(() -> new NotificationNotFoundException(id));
+            log.warn("Ignoring dead-letter for {}: it is {}, not PENDING", id, current.getStatus());
+            return;
+        }
+        Notification dead = repository.findById(id)
                 .orElseThrow(() -> new NotificationNotFoundException(id));
-        notification.markDead(reason);
-        repository.save(notification);
-        metrics.dead(metrics.tenantName(notification.getTenantId()));
-        return notification.getAttempts();
+        metrics.dead(metrics.tenantName(dead.getTenantId()));
+        log.warn("Notification {} dead-lettered after {} attempts: {}", id, dead.getAttempts(), reason);
     }
 
     /**

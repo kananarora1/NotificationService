@@ -75,6 +75,18 @@ public class Notification {
     @Column
     private String failureReason;
 
+    /**
+     * Identifies the consumer holding the SENDING lease; null in every other status.
+     * Read-only here: only the guarded UPDATEs in {@code NotificationRepository} write
+     * it, so a stray {@code save()} can never resurrect or clobber a lease.
+     */
+    @Column(name = "claim_token", insertable = false, updatable = false)
+    private UUID claimToken;
+
+    /** When the current SENDING lease began (database clock); null when not SENDING. */
+    @Column(name = "claimed_at", insertable = false, updatable = false)
+    private Instant claimedAt;
+
     protected Notification() {
         // for JPA
     }
@@ -89,24 +101,8 @@ public class Notification {
         this.attempts = 0;
     }
 
-    public void markSent(Instant sentAt) {
-        this.status = NotificationStatus.SENT;
-        this.sentAt = sentAt;
-    }
-
     public void markFailed() {
         this.status = NotificationStatus.FAILED;
-    }
-
-    /** Marks the notification permanently failed (retries exhausted, dead-lettered). */
-    public void markDead(String failureReason) {
-        this.status = NotificationStatus.DEAD;
-        this.failureReason = failureReason;
-    }
-
-    /** Records that another delivery attempt is starting and returns the new count. */
-    public int incrementAttempts() {
-        return ++this.attempts;
     }
 
     public UUID getId() {
@@ -143,6 +139,14 @@ public class Notification {
 
     public String getFailureReason() {
         return failureReason;
+    }
+
+    public UUID getClaimToken() {
+        return claimToken;
+    }
+
+    public Instant getClaimedAt() {
+        return claimedAt;
     }
 
     public String getIdempotencyKey() {

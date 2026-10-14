@@ -3,6 +3,8 @@ package com.example.notification.api;
 import com.example.notification.domain.Channel;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
+import com.example.notification.messaging.NotificationPublisher;
+import com.example.notification.provider.NotificationProvider;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.ratelimit.RateLimiter;
 import com.example.notification.repository.NotificationRepository;
@@ -32,6 +34,7 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -50,12 +53,14 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -104,6 +109,46 @@ class NotificationIntegrationTest {
         MutableClock testClock() {
             return new MutableClock(Instant.parse("2026-07-01T00:00:00Z"), ZoneOffset.UTC);
         }
+
+        /** Wraps the real provider so a test can make one send hang (see GatedProvider). */
+        @Bean
+        @Primary
+        GatedProvider gatedProvider(SimulatedProvider delegate) {
+            return new GatedProvider(delegate);
+        }
+    }
+
+    /**
+     * Delegates every send to {@link SimulatedProvider}, except that a test can make the
+     * next send of one id <em>deliver and then hang</em> until released — a provider that
+     * accepted the notification but is slow to answer, so the send outlives its lease.
+     */
+    static class GatedProvider implements NotificationProvider {
+
+        private final SimulatedProvider delegate;
+        private final Map<UUID, CountDownLatch> holds = new ConcurrentHashMap<>();
+
+        GatedProvider(SimulatedProvider delegate) {
+            this.delegate = delegate;
+        }
+
+        void holdAfterDelivering(UUID id, CountDownLatch release) {
+            holds.put(id, release);
+        }
+
+        @Override
+        public void send(Notification notification) {
+            CountDownLatch hold = holds.remove(notification.getId());
+            delegate.send(notification);
+            if (hold != null) {
+                try {
+                    hold.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }
+        }
     }
 
     @Autowired
@@ -117,6 +162,15 @@ class NotificationIntegrationTest {
 
     @Autowired
     private NotificationService service;
+
+    @Autowired
+    private NotificationPublisher publisher;
+
+    @Autowired
+    private GatedProvider gatedProvider;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
 
     @Autowired
     private MutableClock clock;
@@ -634,6 +688,9 @@ class NotificationIntegrationTest {
                 .contains("notifications_delivery_latency_seconds")
                 .contains("notifications_end_to_end_latency_seconds")
                 .contains("notifications_pending")
+                .contains("notifications_sending")
+                .contains("notifications_stuck_sending")
+                .contains("notifications_reclaimed_total")
                 .contains("queue_depth");
 
         // Auto-provided infrastructure metrics are exported too.
@@ -715,7 +772,155 @@ class NotificationIntegrationTest {
         assertThat(ApiKeyHasher.sha256Hex(ACME_KEY)).isNotEqualTo(ApiKeyHasher.sha256Hex(GLOBEX_KEY));
     }
 
+    // ---- v10: a stranded SENDING claim recovers (lease + reconciler) ----
+
+    @Test
+    void strandedSendingClaimIsRecoveredAndDelivered() {
+        double reclaimedBefore = counter("notifications.reclaimed");
+        Notification n = new Notification("strand@example.com", Channel.EMAIL, "recover me");
+        repository.save(n);
+        UUID id = n.getId();
+
+        // A consumer wins the claim and then dies (kill -9, OOM, a DB error after the
+        // claim) before it writes SENT. Nothing ever completes or releases this claim.
+        claimAndAbandon(id);
+
+        // The broker redelivers the dead consumer's unacked message to a live one.
+        publisher.publish(id);
+
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            Notification stored = repository.findById(id).orElseThrow();
+            assertThat(stored.getStatus()).as("status of the stranded notification")
+                    .isEqualTo(NotificationStatus.SENT);
+            assertThat(provider.invocationTimes(id)).as("provider calls").hasSize(1);
+        });
+        assertThat(provider.wasDelivered(id)).isTrue();
+        assertThat(counter("notifications.reclaimed")).isGreaterThanOrEqualTo(reclaimedBefore + 1);
+    }
+
+    @Test
+    void staleLeaseHolderCannotOverwriteOrReleaseAfterReclaim() {
+        Notification n = new Notification("lease@example.com", Channel.EMAIL, "guarded");
+        repository.save(n);
+        UUID id = n.getId();
+        UUID tokenA = UUID.randomUUID();
+        UUID tokenB = UUID.randomUUID();
+
+        // A claims; its lease is reclaimed (the sweep's UPDATE, minus the republish);
+        // B claims next.
+        assertThat(repository.claimForSending(id, tokenA)).isEqualTo(1);
+        transactionTemplate.executeWithoutResult(tx -> repository.reclaim(List.of(id)));
+        assertThat(repository.claimForSending(id, tokenB)).isEqualTo(1);
+
+        // A comes back late. Neither of its writes may touch B's lease.
+        assertThat(repository.markSent(id, tokenA, Instant.now())).as("stale SENT").isZero();
+        assertThat(repository.releaseClaim(id, tokenA)).as("stale release").isZero();
+        Notification held = repository.findById(id).orElseThrow();
+        assertThat(held.getStatus()).isEqualTo(NotificationStatus.SENDING);
+        assertThat(held.getClaimToken()).isEqualTo(tokenB);
+        assertThat(held.getAttempts()).isEqualTo(2);
+
+        // The current holder's write still works, and clears the lease.
+        assertThat(repository.markSent(id, tokenB, Instant.now())).isEqualTo(1);
+        Notification sent = repository.findById(id).orElseThrow();
+        assertThat(sent.getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(sent.getClaimToken()).isNull();
+        assertThat(sent.getClaimedAt()).isNull();
+    }
+
+    @Test
+    void workerWhoseLeaseWasReclaimedDropsItsLateResultWithoutOverwriting() throws Exception {
+        Notification n = new Notification("slow-ack@example.com", Channel.EMAIL, "outlives its lease");
+        repository.save(n);
+        UUID id = n.getId();
+        CountDownLatch release = new CountDownLatch(1);
+        gatedProvider.holdAfterDelivering(id, release);
+
+        ExecutorService workerA = Executors.newSingleThreadExecutor();
+        try {
+            // Worker A claims and delivers, then hangs before it can record SENT.
+            Future<?> a = workerA.submit(() -> service.attemptDelivery(id));
+            await().atMost(Duration.ofSeconds(5)).until(() -> provider.wasDelivered(id));
+
+            // A's lease runs out while it hangs. The scheduled reconciler reclaims and
+            // republishes, and a live consumer (B) claims it and finishes the job.
+            expireLease(id);
+            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+                Notification stored = repository.findById(id).orElseThrow();
+                assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+                assertThat(stored.getAttempts()).isEqualTo(2);
+            });
+            Instant sentAtByB = repository.findById(id).orElseThrow().getSentAt();
+
+            // A finally resumes. Its SENT write is guarded by its own (stale) token, so it
+            // matches no row; it must neither overwrite B's result nor throw (a throw
+            // would send this copy round the retry loop and on to the DLQ).
+            release.countDown();
+            a.get(10, TimeUnit.SECONDS);
+
+            Notification stored = repository.findById(id).orElseThrow();
+            assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(stored.getSentAt()).as("sentAt written by B, untouched by A").isEqualTo(sentAtByB);
+            assertThat(stored.getAttempts()).isEqualTo(2);
+
+            // The double-send contract: called twice, delivered once.
+            assertThat(provider.invocationTimes(id)).hasSize(2);
+            assertThat(provider.duplicatesIgnored(id)).isEqualTo(1);
+        } finally {
+            release.countDown();
+            workerA.shutdownNow();
+        }
+    }
+
+    @Test
+    void redeliveryOfASentNotificationIsStillSkipped() throws Exception {
+        UUID id = postNotify("resend@example.com");
+        await().atMost(Duration.ofSeconds(10)).until(() ->
+                repository.findById(id).orElseThrow().getStatus() == NotificationStatus.SENT);
+        Instant sentAt = repository.findById(id).orElseThrow().getSentAt();
+
+        publisher.publish(id); // a broker redelivery arriving after SENT
+
+        await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            Notification stored = repository.findById(id).orElseThrow();
+            assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(stored.getAttempts()).isEqualTo(1);
+            assertThat(stored.getSentAt()).isEqualTo(sentAt);
+            assertThat(provider.invocationTimes(id)).hasSize(1);
+        });
+    }
+
+    @Test
+    void lateDeadLetterDoesNotOverwriteASentNotification() {
+        Notification n = new Notification("late-dlq@example.com", Channel.EMAIL, "already sent");
+        repository.save(n);
+        UUID id = n.getId();
+        service.attemptDelivery(id);
+        double deadBefore = counter("notifications.dead", "tenant", "unknown");
+
+        // A stale copy of this message exhausted its retries and reached the DLQ.
+        service.markDead(id, "late dead-letter");
+
+        Notification stored = repository.findById(id).orElseThrow();
+        assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(stored.getFailureReason()).isNull();
+        assertThat(counter("notifications.dead", "tenant", "unknown")).isEqualTo(deadBefore);
+    }
+
     // ---- helpers ----
+
+    /** Claims the row the way a consumer does, then never finishes: the crash. */
+    private void claimAndAbandon(UUID id) {
+        assertThat(repository.claimForSending(id, UUID.randomUUID())).isEqualTo(1);
+        // The holder is dead, so nothing renews its lease and it runs out.
+        expireLease(id);
+    }
+
+    /** Stands in for waiting out the 60s lease: moves the claim 10 minutes into the past. */
+    private void expireLease(UUID id) {
+        jdbcTemplate.update(
+                "update notifications set claimed_at = now() - interval '10 minutes' where id = ?", id);
+    }
 
     private UUID tenantId(String apiKey) {
         return tenantByKey(apiKey).getId();
