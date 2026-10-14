@@ -1,5 +1,7 @@
 package com.example.notification.api;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.example.notification.domain.Channel;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
@@ -20,6 +22,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -52,6 +55,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -110,39 +114,60 @@ class NotificationIntegrationTest {
             return new MutableClock(Instant.parse("2026-07-01T00:00:00Z"), ZoneOffset.UTC);
         }
 
-        /** Wraps the real provider so a test can make one send hang (see GatedProvider). */
+        /** Wraps the real provider with the test instrumentation (see RecordingProvider). */
         @Bean
         @Primary
-        GatedProvider gatedProvider(SimulatedProvider delegate) {
-            return new GatedProvider(delegate);
+        RecordingProvider recordingProvider(SimulatedProvider delegate) {
+            return new RecordingProvider(delegate);
         }
     }
 
     /**
-     * Delegates every send to {@link SimulatedProvider}, except that a test can make the
-     * next send of one id <em>deliver and then hang</em> until released — a provider that
-     * accepted the notification but is slow to answer, so the send outlives its lease.
+     * Test-side instrumentation around {@link SimulatedProvider}, so the production class
+     * carries none of it. Records every send() call per notification (the backoff test
+     * reads the timestamps), and can make the next send of one id <em>deliver and then
+     * hang</em> until released — a provider that accepted the notification but is slow to
+     * answer, so the send outlives its lease.
      */
-    static class GatedProvider implements NotificationProvider {
+    static class RecordingProvider implements NotificationProvider {
 
         private final SimulatedProvider delegate;
-        private final Map<UUID, CountDownLatch> holds = new ConcurrentHashMap<>();
+        private final Map<UUID, List<Long>> invocationTimes = new ConcurrentHashMap<>();
+        private final Map<UUID, Hold> holds = new ConcurrentHashMap<>();
 
-        GatedProvider(SimulatedProvider delegate) {
+        private record Hold(CountDownLatch reached, CountDownLatch release) {
+        }
+
+        RecordingProvider(SimulatedProvider delegate) {
             this.delegate = delegate;
         }
 
-        void holdAfterDelivering(UUID id, CountDownLatch release) {
-            holds.put(id, release);
+        /** Returns a latch that opens once that send has delivered and is now hanging. */
+        CountDownLatch holdAfterDelivering(UUID id, CountDownLatch release) {
+            CountDownLatch reached = new CountDownLatch(1);
+            holds.put(id, new Hold(reached, release));
+            return reached;
+        }
+
+        /** Snapshot of the send() call timestamps for one notification. */
+        List<Long> invocationTimes(UUID id) {
+            List<Long> times = invocationTimes.getOrDefault(id, List.of());
+            synchronized (times) {
+                return List.copyOf(times);
+            }
         }
 
         @Override
         public void send(Notification notification) {
-            CountDownLatch hold = holds.remove(notification.getId());
+            invocationTimes
+                    .computeIfAbsent(notification.getId(), k -> Collections.synchronizedList(new ArrayList<>()))
+                    .add(System.currentTimeMillis());
+            Hold hold = holds.remove(notification.getId());
             delegate.send(notification);
             if (hold != null) {
+                hold.reached().countDown();
                 try {
-                    hold.await(30, TimeUnit.SECONDS);
+                    hold.release().await(30, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new IllegalStateException(e);
@@ -158,16 +183,13 @@ class NotificationIntegrationTest {
     private NotificationRepository repository;
 
     @Autowired
-    private SimulatedProvider provider;
+    private RecordingProvider provider;
 
     @Autowired
     private NotificationService service;
 
     @Autowired
     private NotificationPublisher publisher;
-
-    @Autowired
-    private GatedProvider gatedProvider;
 
     @Autowired
     private TransactionTemplate transactionTemplate;
@@ -794,7 +816,6 @@ class NotificationIntegrationTest {
                     .isEqualTo(NotificationStatus.SENT);
             assertThat(provider.invocationTimes(id)).as("provider calls").hasSize(1);
         });
-        assertThat(provider.wasDelivered(id)).isTrue();
         assertThat(counter("notifications.reclaimed")).isGreaterThanOrEqualTo(reclaimedBefore + 1);
     }
 
@@ -834,13 +855,14 @@ class NotificationIntegrationTest {
         repository.save(n);
         UUID id = n.getId();
         CountDownLatch release = new CountDownLatch(1);
-        gatedProvider.holdAfterDelivering(id, release);
+        CountDownLatch delivered = provider.holdAfterDelivering(id, release);
+        ListAppender<ILoggingEvent> providerLog = captureProviderLog();
 
         ExecutorService workerA = Executors.newSingleThreadExecutor();
         try {
             // Worker A claims and delivers, then hangs before it can record SENT.
             Future<?> a = workerA.submit(() -> service.attemptDelivery(id));
-            await().atMost(Duration.ofSeconds(5)).until(() -> provider.wasDelivered(id));
+            assertThat(delivered.await(5, TimeUnit.SECONDS)).as("worker A delivered").isTrue();
 
             // A's lease runs out while it hangs. The scheduled reconciler reclaims and
             // republishes, and a live consumer (B) claims it and finishes the job.
@@ -863,12 +885,16 @@ class NotificationIntegrationTest {
             assertThat(stored.getSentAt()).as("sentAt written by B, untouched by A").isEqualTo(sentAtByB);
             assertThat(stored.getAttempts()).isEqualTo(2);
 
-            // The double-send contract: called twice, delivered once.
+            // The double-send contract: called twice, delivered once. The simulator's
+            // "sent to" log line is its delivery, so that is what is counted.
             assertThat(provider.invocationTimes(id)).hasSize(2);
-            assertThat(provider.duplicatesIgnored(id)).isEqualTo(1);
+            List<String> messages = messages(providerLog);
+            assertThat(messages).filteredOn(m -> m.startsWith("sent to slow-ack@example.com")).hasSize(1);
+            assertThat(messages).filteredOn(m -> m.startsWith("already delivered " + id)).hasSize(1);
         } finally {
             release.countDown();
             workerA.shutdownNow();
+            releaseProviderLog(providerLog);
         }
     }
 
@@ -908,6 +934,25 @@ class NotificationIntegrationTest {
     }
 
     // ---- helpers ----
+
+    /** Captures SimulatedProvider's log, where each "sent to …" line is one delivery. */
+    private static ListAppender<ILoggingEvent> captureProviderLog() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(SimulatedProvider.class)).addAppender(appender);
+        return appender;
+    }
+
+    private static void releaseProviderLog(ListAppender<ILoggingEvent> appender) {
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(SimulatedProvider.class)).detachAppender(appender);
+    }
+
+    /** Listener threads may still be logging; copy under the appender's own lock. */
+    private static List<String> messages(ListAppender<ILoggingEvent> appender) {
+        synchronized (appender) {
+            return appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+        }
+    }
 
     /** Claims the row the way a consumer does, then never finishes: the crash. */
     private void claimAndAbandon(UUID id) {

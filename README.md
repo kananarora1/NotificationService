@@ -60,7 +60,13 @@ failure paths so they are testable on demand:
 `SimulatedProvider` is also **idempotent on the notification id**: a repeat send of an
 id it has already delivered is acknowledged without delivering again (logged as
 `already delivered {id}`). Every provider must behave this way — see
-[the double-send contract](#the-double-send-contract).
+[the double-send contract](#the-double-send-contract). Its record of delivered ids lives
+in the JVM, though, so unlike a real provider's it is forgotten on restart and not shared
+between instances: it demonstrates the contract within one process, not across a crash.
+
+`SimulatedProvider` is for development and tests only. It is inactive under the `prod`
+profile, so starting with `SPRING_PROFILES_ACTIVE=prod` fails until a real
+`NotificationProvider` bean exists — deliberately, rather than "delivering" into a log.
 
 ## Architecture (v4)
 
@@ -237,9 +243,12 @@ id. That is deliberate. It is safe only because:
 
 - **Every `NotificationProvider` must be idempotent on `notification.getId()`.** A
   repeat call for a delivered id must succeed without delivering again. For a real
-  provider, pass the notification id as its idempotency key (most email/SMS APIs take
-  one); otherwise record delivered ids before acknowledging. `SimulatedProvider` does
-  the latter.
+  provider, pass the notification id as its idempotency key — if its API takes one; many
+  email/SMS APIs do not, so check. Without one, exactly-once is impossible: a record kept
+  by this app can only be written *after* the send returns, which is the same gap `SENT`
+  leaves. Then either accept the rare duplicate, or narrow the gap with provider features
+  (tag the message with the id and look it up before resending, or record `SENT` from
+  delivery webhooks).
 - **Provider calls must time out well below `lease-timeout`**, so a slow send fails and
   retries rather than being reclaimed underneath itself.
 
@@ -944,7 +953,11 @@ docker exec notification-postgres psql -U notifications -d notifications \
   in `.env.example`, if `.env` stops being gitignored, or if a `.env` is ever tracked.
   It also exercises the placeholder itself: `ACME_API_KEY` set overrides the seeded key,
   absent falls back to the development default.
-- `SimulatedProviderTest` — unit test for the stubbed provider.
+- `SimulatedProviderTest` — unit test for the stubbed provider: a repeat send of a
+  delivered id is a no-op, a failed `flaky@` attempt is never recorded as delivered, and
+  the bean is absent under the `prod` profile. Deliveries are asserted on the provider's
+  log, so the production class carries no test-only accessors; the integration test's
+  `RecordingProvider` wrapper does the call recording.
 
 > The integration test needs a running Docker daemon (Testcontainers starts the
 > Postgres, RabbitMQ and Redis containers automatically — no need to `docker compose

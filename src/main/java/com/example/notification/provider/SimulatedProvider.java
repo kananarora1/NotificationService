@@ -3,34 +3,39 @@ package com.example.notification.provider;
 import com.example.notification.domain.Notification;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Stubbed provider that mimics a slow external delivery API. It does not perform
  * any real delivery (no SMTP, no SMS gateway) — it just sleeps and logs.
  *
+ * <p>Development and test only: inactive under the {@code prod} profile, so a production
+ * deployment fails at startup until a real {@link NotificationProvider} is configured,
+ * rather than silently "delivering" into a log.
+ *
  * <p>Two recipients drive the failure paths so they are testable on demand:
  * <ul>
  *   <li>{@code fail@example.com} — always throws (permanent failure → ends DEAD after
  *       retries are exhausted).</li>
- *   <li>{@code flaky@example.com} — throws on the first two attempts for a given
- *       notification, then succeeds (transient failure → recovers to SENT via retry).</li>
+ *   <li>{@code flaky@example.com} — throws until the notification's third attempt
+ *       (transient failure → recovers to SENT via retry). Driven by the attempt count the
+ *       delivery claim records, so the simulator keeps no per-notification state for it.</li>
  * </ul>
  *
  * <p>Idempotent on the notification id, as {@link NotificationProvider} requires: once an
  * id has been delivered, a repeat send of it is acknowledged without delivering again —
- * which is how a real provider treats a repeated idempotency key. That is what keeps the
- * reconciler's at-least-once retries from reaching the recipient twice.
+ * how a real provider treats a repeated idempotency key. Unlike a real provider's
+ * server-side record, though, this one lives in this JVM: a restart forgets it, and each
+ * instance has its own. So it shows the contract within one process; it does not prove it
+ * across a crash.
  */
 @Component
+@Profile("!prod")
 public class SimulatedProvider implements NotificationProvider {
 
     private static final Logger log = LoggerFactory.getLogger(SimulatedProvider.class);
@@ -41,22 +46,11 @@ public class SimulatedProvider implements NotificationProvider {
     private static final String FLAKY_RECIPIENT = "flaky@example.com";
     private static final int FLAKY_FAILURES = 2;
 
-    /** Per-notification attempt counter used to make {@code flaky@example.com} deterministic. */
-    private final ConcurrentHashMap<UUID, AtomicInteger> flakyAttempts = new ConcurrentHashMap<>();
-
-    /** Wall-clock timestamps of each send() invocation per notification (for backoff assertions). */
-    private final ConcurrentHashMap<UUID, List<Long>> invocationTimes = new ConcurrentHashMap<>();
-
-    /** Ids delivered so far: the provider-side record that makes a repeat send a no-op. */
+    /** Ids delivered by this JVM: the stand-in for a provider's idempotency-key store. */
     private final Set<UUID> delivered = ConcurrentHashMap.newKeySet();
-
-    /** Per-notification count of repeat sends that were acknowledged without delivering. */
-    private final ConcurrentHashMap<UUID, AtomicInteger> duplicatesIgnored = new ConcurrentHashMap<>();
 
     @Override
     public void send(Notification notification) {
-        recordInvocation(notification.getId());
-
         try {
             Thread.sleep(SIMULATED_LATENCY_MILLIS);
         } catch (InterruptedException e) {
@@ -70,50 +64,18 @@ public class SimulatedProvider implements NotificationProvider {
             throw new IllegalStateException("Simulated permanent failure for " + FAILING_RECIPIENT);
         }
 
-        if (FLAKY_RECIPIENT.equalsIgnoreCase(recipient)) {
-            int attempt = flakyAttempts
-                    .computeIfAbsent(notification.getId(), k -> new AtomicInteger())
-                    .incrementAndGet();
-            if (attempt <= FLAKY_FAILURES) {
-                throw new IllegalStateException(
-                        "Simulated transient failure for " + FLAKY_RECIPIENT + " (attempt " + attempt + ")");
-            }
+        // getAttempts() is 1 on the first attempt: the claim increments it before the send.
+        if (FLAKY_RECIPIENT.equalsIgnoreCase(recipient) && notification.getAttempts() <= FLAKY_FAILURES) {
+            throw new IllegalStateException(
+                    "Simulated transient failure for " + FLAKY_RECIPIENT + " (attempt " + notification.getAttempts() + ")");
         }
 
-        // Atomic check-and-record, so two concurrent sends of one id still deliver once.
+        // Recorded only once delivery succeeds, so a failed attempt is never mistaken for a
+        // delivered one. add() is atomic: of two concurrent sends of one id, one delivers.
         if (!delivered.add(notification.getId())) {
-            duplicatesIgnored.computeIfAbsent(notification.getId(), k -> new AtomicInteger()).incrementAndGet();
             log.info("already delivered {}; acknowledging the repeat send without delivering", notification.getId());
             return;
         }
         log.info("sent to {} via {}", recipient, notification.getChannel());
-    }
-
-    private void recordInvocation(UUID id) {
-        invocationTimes
-                .computeIfAbsent(id, k -> Collections.synchronizedList(new ArrayList<>()))
-                .add(System.currentTimeMillis());
-    }
-
-    /** Whether this notification has actually been delivered (not merely attempted). */
-    public boolean wasDelivered(UUID id) {
-        return delivered.contains(id);
-    }
-
-    /** How many repeat sends of an already-delivered notification were ignored. */
-    public int duplicatesIgnored(UUID id) {
-        AtomicInteger count = duplicatesIgnored.get(id);
-        return count == null ? 0 : count.get();
-    }
-
-    /** Returns a snapshot of the send() invocation timestamps for a notification. */
-    public List<Long> invocationTimes(UUID id) {
-        List<Long> times = invocationTimes.get(id);
-        if (times == null) {
-            return List.of();
-        }
-        synchronized (times) {
-            return List.copyOf(times);
-        }
     }
 }
