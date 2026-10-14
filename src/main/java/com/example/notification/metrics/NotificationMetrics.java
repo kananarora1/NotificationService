@@ -24,6 +24,7 @@ public class NotificationMetrics {
     private final TenantRepository tenants;
     private final ConcurrentHashMap<UUID, String> tenantNameCache = new ConcurrentHashMap<>();
     private final Counter reclaimed;
+    private final Counter republished;
 
     public NotificationMetrics(MeterRegistry registry, TenantRepository tenants) {
         this.registry = registry;
@@ -32,7 +33,10 @@ public class NotificationMetrics {
         // on first increment is born at its full value, which rate()/increase() read as
         // no change — the blind spot described on DeadLetterGrowing in alerts.yml.
         this.reclaimed = Counter.builder("notifications.reclaimed")
-                .description("SENDING rows whose lease expired, returned to PENDING and republished")
+                .description("SENDING rows whose lease expired, returned to PENDING for republishing")
+                .register(registry);
+        this.republished = Counter.builder("notifications.republished")
+                .description("PENDING rows with no confirmed message that the reconciler republished, confirmed")
                 .register(registry);
     }
 
@@ -56,9 +60,17 @@ public class NotificationMetrics {
         registry.counter("notifications.dead", "tenant", tenant).increment();
     }
 
-    /** The reconciler returned stranded SENDING rows to PENDING and republished them. */
+    /** The reconciler returned stranded SENDING rows to PENDING (they are then republished). */
     public void reclaimed(int count) {
         reclaimed.increment(count);
+    }
+
+    /**
+     * The reconciler republished rows that had no confirmed message and the broker
+     * confirmed them. Includes rows it reclaimed from SENDING, which need a new message.
+     */
+    public void republished(int count) {
+        republished.increment(count);
     }
 
     /** A request was rejected by the rate limiter (429). */

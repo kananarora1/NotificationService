@@ -100,15 +100,64 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
             """, nativeQuery = true)
     List<UUID> lockExpiredLeases(@Param("leaseMillis") long leaseMillis, @Param("limit") int limit);
 
-    /** Returns locked, expired SENDING rows to PENDING and clears their lease. */
+    /**
+     * Returns locked, expired SENDING rows to PENDING and clears their lease. Also clears
+     * published_at: the dead consumer's message is gone, so the row now needs a new one,
+     * which the reconciler's republish pass provides.
+     */
     @Transactional(propagation = Propagation.MANDATORY)
     @Modifying(clearAutomatically = true)
     @Query(value = """
             update notifications
-               set status = 'PENDING', claim_token = null, claimed_at = null
+               set status = 'PENDING', claim_token = null, claimed_at = null, published_at = null
              where id in (:ids) and status = 'SENDING'
             """, nativeQuery = true)
     int reclaim(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Records that the broker confirmed this row's message. Only fills an empty value, so
+     * a late or repeated confirm never moves it.
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = "update notifications set published_at = now() where id = :id and published_at is null",
+            nativeQuery = true)
+    int markPublished(@Param("id") UUID id);
+
+    /**
+     * PENDING rows with no confirmed message, older than {@code graceMillis} — the
+     * reconciler's republish candidates. The grace keeps it off a row whose create() is
+     * still publishing. Unlocked: each candidate is locked and re-checked individually.
+     */
+    @Query(value = """
+            select id from notifications
+             where status = 'PENDING' and published_at is null
+               and created_at < now() - :graceMillis * interval '1 millisecond'
+             order by created_at
+             limit :limit
+            """, nativeQuery = true)
+    List<UUID> findUnpublishedPending(@Param("graceMillis") long graceMillis, @Param("limit") int limit);
+
+    /**
+     * Locks one republish candidate if it still needs it. Empty if it has since been
+     * published, claimed or finished — or if another instance holds it (SKIP LOCKED), so
+     * two instances never republish the same row at once.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Query(value = """
+            select id from notifications
+             where id = :id and status = 'PENDING' and published_at is null
+             for update skip locked
+            """, nativeQuery = true)
+    List<UUID> lockUnpublishedPending(@Param("id") UUID id);
+
+    /** Same predicate as {@link #findUnpublishedPending}, counted, for the unpublished_pending gauge. */
+    @Query(value = """
+            select count(*) from notifications
+             where status = 'PENDING' and published_at is null
+               and created_at < now() - :graceMillis * interval '1 millisecond'
+            """, nativeQuery = true)
+    long countUnpublishedPending(@Param("graceMillis") long graceMillis);
 
     /** Same predicate as {@link #lockExpiredLeases}, counted, for the stuck_sending gauge. */
     @Query(value = """

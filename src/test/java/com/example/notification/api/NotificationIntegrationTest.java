@@ -6,6 +6,7 @@ import com.example.notification.domain.Channel;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 import com.example.notification.messaging.NotificationPublisher;
+import com.example.notification.messaging.RabbitConfig;
 import com.example.notification.provider.NotificationProvider;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.ratelimit.RateLimiter;
@@ -20,14 +21,23 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import jakarta.servlet.ServletException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
+import org.springframework.amqp.AmqpConnectException;
+import org.springframework.amqp.core.AmqpAdmin;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.listener.AbstractMessageListenerContainer;
+import org.springframework.amqp.rabbit.listener.MessageListenerContainer;
+import org.springframework.amqp.rabbit.listener.RabbitListenerEndpointRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
@@ -36,6 +46,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -51,10 +62,12 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.net.ConnectException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +82,10 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -194,6 +211,16 @@ class NotificationIntegrationTest {
     @Autowired
     private TransactionTemplate transactionTemplate;
 
+    /** Real template; a test can make one send fail the way it does while the broker is down. */
+    @SpyBean
+    private RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private AmqpAdmin amqpAdmin;
+
+    @Autowired
+    private RabbitListenerEndpointRegistry listenerRegistry;
+
     @Autowired
     private MutableClock clock;
 
@@ -235,6 +262,7 @@ class NotificationIntegrationTest {
             assertThat(stored.getStatus()).isEqualTo(NotificationStatus.SENT);
             assertThat(stored.getAttempts()).isEqualTo(1);
             assertThat(stored.getSentAt()).isNotNull();
+            assertThat(stored.getPublishedAt()).as("broker confirmed the publish").isNotNull();
         });
     }
 
@@ -713,6 +741,8 @@ class NotificationIntegrationTest {
                 .contains("notifications_sending")
                 .contains("notifications_stuck_sending")
                 .contains("notifications_reclaimed_total")
+                .contains("notifications_republished_total")
+                .contains("notifications_unpublished_pending")
                 .contains("queue_depth");
 
         // Auto-provided infrastructure metrics are exported too.
@@ -933,7 +963,92 @@ class NotificationIntegrationTest {
         assertThat(counter("notifications.dead", "tenant", "unknown")).isEqualTo(deadBefore);
     }
 
+    // ---- v11: a publish that fails on create is recovered ----
+
+    @Test
+    void publishFailureOnCreateIsRecoveredAndDelivered() throws Exception {
+        // The broker refuses the next publish, as it does while RabbitMQ is down. Every
+        // RabbitTemplate send overload goes through this one.
+        doThrow(new AmqpConnectException(new ConnectException("broker down (test)")))
+                .doCallRealMethod()
+                .when(rabbitTemplate)
+                .convertAndSend(anyString(), anyString(), any(Object.class), nullable(CorrelationData.class));
+        String key = "b2-" + UUID.randomUUID();
+
+        int firstStatus = statusOf(notifyPost("b2@example.com", ACME_KEY).header("Idempotency-Key", key));
+
+        // The row committed before the publish failed, and no message exists for it.
+        Notification row = repository.findByTenantIdAndIdempotencyKey(tenantId(ACME_KEY), key).orElseThrow();
+        UUID id = row.getId();
+        assertThat(row.getStatus()).isEqualTo(NotificationStatus.PENDING);
+        assertThat(row.getAttempts()).as("never claimed by a consumer").isZero();
+        assertThat(amqpAdmin.getQueueInfo(RabbitConfig.SEND_QUEUE).getMessageCount()).as("ready messages").isZero();
+
+        // The client retries with the same key and is told the notification is PENDING.
+        mockMvc.perform(notifyPost("b2@example.com", ACME_KEY).header("Idempotency-Key", key))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(id.toString()))
+                .andExpect(jsonPath("$.status").value("PENDING"));
+
+        // Time passes beyond the grace period a just-created row gets before it is swept.
+        backdateCreatedAt(id);
+
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            assertThat(repository.findById(id).orElseThrow().getStatus())
+                    .as("status of the notification whose publish failed (first POST answered %d)", firstStatus)
+                    .isEqualTo(NotificationStatus.SENT);
+            assertThat(provider.invocationTimes(id)).as("provider calls").hasSize(1);
+        });
+        // Durably accepted despite the failed publish: 202, not 500.
+        assertThat(firstStatus).isEqualTo(HttpStatus.ACCEPTED.value());
+    }
+
+    @Test
+    void republishingAnIdThatIsAlreadyQueuedDeliversItOnce() {
+        Notification n = new Notification("requeued@example.com", Channel.EMAIL, "already queued");
+        repository.save(n);
+        UUID id = n.getId();
+        double republishedBefore = counter("notifications.republished");
+
+        withSendQueuePaused(() -> {
+            // A message for this id reaches the queue, but its confirm is never recorded
+            // (lost, or the app died first), so the row still reads as unpublished.
+            assertThat(publisher.publish(id)).as("first copy confirmed").isTrue();
+            backdateCreatedAt(id);
+
+            // The scheduled reconciler sees PENDING + published_at null and publishes again.
+            await().atMost(Duration.ofSeconds(5))
+                    .until(() -> repository.findById(id).orElseThrow().getPublishedAt() != null);
+            assertThat(amqpAdmin.getQueueInfo(RabbitConfig.SEND_QUEUE).getMessageCount())
+                    .as("both copies queued").isEqualTo(2);
+        });
+
+        // Both copies are consumed: one claims and delivers, the other finds it claimed.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(amqpAdmin.getQueueInfo(RabbitConfig.SEND_QUEUE).getMessageCount()).isZero();
+        });
+        await().during(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(3))
+                .until(() -> provider.invocationTimes(id).size() == 1);
+        assertThat(counter("notifications.republished")).isGreaterThanOrEqualTo(republishedBefore + 1);
+    }
+
     // ---- helpers ----
+
+    /** The status a client would see: MockMvc rethrows an unhandled exception instead of answering 500. */
+    private int statusOf(MockHttpServletRequestBuilder request) throws Exception {
+        try {
+            return mockMvc.perform(request).andReturn().getResponse().getStatus();
+        } catch (ServletException e) {
+            return HttpStatus.INTERNAL_SERVER_ERROR.value();
+        }
+    }
+
+    /** Stands in for waiting out the reconciler's publish grace: moves created_at 10 minutes back. */
+    private void backdateCreatedAt(UUID id) {
+        jdbcTemplate.update(
+                "update notifications set created_at = created_at - interval '10 minutes' where id = ?", id);
+    }
 
     /** Captures SimulatedProvider's log, where each "sent to …" line is one delivery. */
     private static ListAppender<ILoggingEvent> captureProviderLog() {
@@ -961,10 +1076,29 @@ class NotificationIntegrationTest {
         expireLease(id);
     }
 
-    /** Stands in for waiting out the 60s lease: moves the claim 10 minutes into the past. */
+    /**
+     * Stands in for waiting out the 60s lease: moves the claim 10 minutes into the past.
+     * created_at moves with it — a row whose lease expired is at least that old — which
+     * also puts it past the publish grace, as a really reclaimed row always is.
+     */
     private void expireLease(UUID id) {
         jdbcTemplate.update(
                 "update notifications set claimed_at = now() - interval '10 minutes' where id = ?", id);
+        backdateCreatedAt(id);
+    }
+
+    /** Stops the notifications.send consumers while {@code action} runs, so messages stay queued. */
+    private void withSendQueuePaused(Runnable action) {
+        MessageListenerContainer container = listenerRegistry.getListenerContainers().stream()
+                .filter(c -> c instanceof AbstractMessageListenerContainer listener
+                        && Arrays.asList(listener.getQueueNames()).contains(RabbitConfig.SEND_QUEUE))
+                .findFirst().orElseThrow();
+        container.stop();
+        try {
+            action.run();
+        } finally {
+            container.start();
+        }
     }
 
     private UUID tenantId(String apiKey) {

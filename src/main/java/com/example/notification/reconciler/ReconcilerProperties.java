@@ -15,11 +15,17 @@ import java.time.Duration;
  *                     single provider call, not the whole retry cycle. Too short and a
  *                     slow-but-alive send is reclaimed and sent twice; too long and a
  *                     crashed send waits that much longer to be retried.
- * @param batchSize    the most rows one sweep reclaims, so a large backlog is worked off
- *                     over several short transactions rather than one long one
+ * @param batchSize    the most rows one sweep reclaims, and separately the most it
+ *                     republishes, so a large backlog is worked off over several sweeps
+ * @param publishGrace how old an unpublished PENDING row must be before it is
+ *                     republished. Keeps the sweep off a row whose create() is still
+ *                     publishing it, so must exceed the slowest publish there:
+ *                     {@code spring.rabbitmq.connection-timeout} plus
+ *                     {@code notifications.publisher.confirm-timeout}.
  */
 @ConfigurationProperties(prefix = "notifications.reconciler")
 public record ReconcilerProperties(
         @DefaultValue("60s") Duration leaseTimeout,
-        @DefaultValue("100") int batchSize) {
+        @DefaultValue("100") int batchSize,
+        @DefaultValue("15s") Duration publishGrace) {
 }

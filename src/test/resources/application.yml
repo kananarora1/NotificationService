@@ -19,6 +19,11 @@ spring:
       # Matches production; host/port come from the Redis container.
       timeout: 200ms
   rabbitmq:
+    # Same publish guarantees as production: create() and the reconciler wait for these.
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
     listener:
       simple:
         concurrency: 4
@@ -44,6 +49,8 @@ notifications:
     # within a second rather than calling it by hand.
     sweep-interval: PT1S
     batch-size: 100
+    # Production grace; tests make a row eligible by backdating created_at.
+    publish-grace: 15s
   seeding:
     enabled: true
     tenants:

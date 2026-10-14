@@ -8,6 +8,7 @@ import com.example.notification.provider.NotificationProvider;
 import com.example.notification.repository.NotificationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -49,11 +50,18 @@ public class NotificationService {
      * the (TOCTOU-prone) pre-check alone: if two identical requests race, exactly
      * one INSERT succeeds and the other catches the constraint violation and returns
      * the winner's row ({@code created = false}). Duplicates are never published.
+     *
+     * <p>Accepted means <b>durably</b> accepted, not "already on the queue". Once the row
+     * is committed nothing here fails the request: if the publish fails or the broker
+     * does not confirm it (RabbitMQ down, say), the row stays PENDING with
+     * {@code published_at} null and {@code LeaseReconciler} republishes it after its
+     * grace period. Answering 500 instead would invite a retry that, without an
+     * Idempotency-Key, creates a second notification for one that will be delivered.
      */
     public CreateResult create(Notification notification, String idempotencyKey) {
         if (!StringUtils.hasText(idempotencyKey)) {
             repository.save(notification);
-            publisher.publish(notification.getId());
+            publish(notification.getId());
             return CreateResult.created(notification);
         }
 
@@ -82,8 +90,29 @@ public class NotificationService {
             return CreateResult.existing(winner);
         }
 
-        publisher.publish(notification.getId());
+        publish(notification.getId());
         return CreateResult.created(notification);
+    }
+
+    /**
+     * Publishes a committed row's id and records {@code published_at} once the broker
+     * confirms it. Never throws: on any failure the row keeps {@code published_at} null,
+     * which is exactly what the reconciler looks for.
+     *
+     * <p>The fast path above may hand a client this row as PENDING before it is published.
+     * That is no longer a dead end: an unpublished PENDING row is always republished.
+     */
+    private void publish(UUID id) {
+        if (!publisher.publish(id)) {
+            return;
+        }
+        try {
+            repository.markPublished(id);
+        } catch (DataAccessException e) {
+            // The message is on the broker but unrecorded; the reconciler will publish a
+            // second copy, which is skipped at the claim.
+            log.warn("Notification {} was published but published_at could not be recorded", id, e);
+        }
     }
 
     /**

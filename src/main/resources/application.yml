@@ -57,6 +57,18 @@ spring:
     port: ${RABBITMQ_PORT:5672}
     username: ${RABBITMQ_USERNAME:guest}
     password: ${RABBITMQ_PASSWORD:guest}
+    # Bounds a publish against a broker that is unreachable but not refusing (amqp-client
+    # waits 60s by default). create() publishes on the request thread, so this caps how
+    # long a POST can hang on RabbitMQ before it answers 202 and leaves the row for the
+    # reconciler.
+    connection-timeout: 5s
+    # A publish counts only once the broker acks it (confirms) and routed it to a queue
+    # (mandatory + returns) — see NotificationPublisher. Without these an unroutable or
+    # dropped message is indistinguishable from a delivered one.
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
     listener:
       simple:
         concurrency: 16
@@ -83,6 +95,10 @@ notifications:
     # How long the RabbitMQ listener containers may spend draining in-flight and
     # prefetched messages on shutdown. Keep below timeout-per-shutdown-phase (30s).
     shutdown-timeout: ${LISTENER_SHUTDOWN_TIMEOUT:25s}
+  publisher:
+    # How long a publish waits for the broker's confirm before it is treated as failed and
+    # left to the reconciler. Keep connection-timeout + this below reconciler.publish-grace.
+    confirm-timeout: ${PUBLISHER_CONFIRM_TIMEOUT:5s}
   reconciler:
     # A SENDING claim older than this is presumed abandoned (its consumer died) and is
     # returned to PENDING and republished. It covers one provider call, not the retry
@@ -92,6 +108,9 @@ notifications:
     # Spring 6.1 does not accept the "30s" shorthand the other durations here use.
     sweep-interval: ${RECONCILER_SWEEP_INTERVAL:PT30S}
     batch-size: 100
+    # An unpublished PENDING row younger than this is left alone: its create() may still
+    # be publishing it. Must exceed connection-timeout + publisher.confirm-timeout (10s).
+    publish-grace: ${RECONCILER_PUBLISH_GRACE:15s}
   seeding:
     # Local-development convenience: ensures these tenants exist on startup, storing
     # only the SHA-256 hash of each key. Set SEED_TENANTS_ENABLED=false in production

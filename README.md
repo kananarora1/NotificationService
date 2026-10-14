@@ -9,8 +9,10 @@ pool of `@RabbitListener` consumers drains the queue and performs delivery, with
 via API keys** (v6), and a **Redis-backed distributed rate limiter** (v7).
 
 A **lease reconciler** (v10) recovers notifications whose consumer died mid-delivery,
-so a crash can delay a send but never strand it. See
-[Crash recovery: leases and the reconciler](#crash-recovery-leases-and-the-reconciler-v10).
+and (v11) republishes any accepted notification whose message never reached the broker,
+so neither a crash nor a RabbitMQ outage strands a send — it can only delay it. See
+[Crash recovery](#crash-recovery-leases-and-the-reconciler-v10) and
+[Publish failures](#publish-failures-confirms-and-republish-v11).
 
 v8 adds **observability** — no new features, just visibility into what already
 exists. The app exports Micrometer metrics (custom business counters/timers/gauges
@@ -33,7 +35,8 @@ See [Observability](#observability-v8).
 A `Notification` has: `id` (UUID), `tenantId` (the API-key tenant that created it),
 `recipient`, `channel` (`EMAIL`/`SMS`/`PUSH`), `message`, `status`, `attempts` (int),
 a nullable `failureReason`, a nullable and **UNIQUE** `idempotencyKey`, `createdAt`,
-a nullable `sentAt`, and the delivery lease `claimToken` / `claimedAt` (both set only
+a nullable `sentAt`, a nullable `publishedAt` (when the broker confirmed its message),
+and the delivery lease `claimToken` / `claimedAt` (both set only
 while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKey`, and
 `rateLimitPerMinute`.
 
@@ -153,7 +156,10 @@ business event (e.g. `order-4711-receipt`):
 - **Header present, key unseen** → create the row (storing the key), publish, return
   `202 Accepted`.
 - **Header present, key seen** → return the **existing** `{ id, status }` with
-  `200 OK`. No second row, no second publish.
+  `200 OK`. No second row, no second publish. A `PENDING` answer here is always
+  followed through, even if the original request's publish failed: a `PENDING` row with
+  no confirmed message is republished by the reconciler (see
+  [Publish failures](#publish-failures-confirms-and-republish-v11)).
 - **Header absent** → always create (unchanged v4 behaviour), `202 Accepted`.
 
 **Why a UNIQUE constraint, not an app-level check.** A naive
@@ -219,9 +225,10 @@ particular, a late dead-letter can no longer turn a `SENT` row into `DEAD`.
 **The reconciler.** `LeaseReconciler` runs every `sweep-interval` (30s). In one short
 transaction it locks up to `batch-size` (100) `SENDING` rows whose lease is older than
 `lease-timeout` (60s) with `SELECT … FOR UPDATE SKIP LOCKED` (so several instances
-never fight over a row), returns them to `PENDING`, and **republishes their ids before
-committing** — if the sweep fails, the rows stay `SENDING` and the next sweep retries,
-so it can never leave a `PENDING` row with no message. Rows stranded before V5 have no
+never fight over a row) and returns them to `PENDING` with `published_at` cleared — the
+dead consumer's message is gone. The same sweep's republish pass then publishes them
+with confirms (see [Publish failures](#publish-failures-confirms-and-republish-v11)), and
+anything not confirmed is retried by the next sweep. Rows stranded before V5 have no
 lease at all and are reclaimed on the first sweep. Each reclaim increments
 `notifications.reclaimed` and logs a `WARN`.
 
@@ -252,9 +259,62 @@ id. That is deliberate. It is safe only because:
 - **Provider calls must time out well below `lease-timeout`**, so a slow send fails and
   retries rather than being reclaimed underneath itself.
 
-**Not covered here** (separate fixes): a row committed as `PENDING` whose publish
-failed, and a dead-letter whose `DEAD` write keeps failing until the DLQ drops it, both
-still leave a `PENDING` row with no message. The reconciler only reclaims `SENDING`.
+## Publish failures: confirms and republish (v11)
+
+**The problem.** `POST /notify` commits the row, *then* publishes its id. If RabbitMQ was
+down, the publish threw: the client got `500`, and the row sat `PENDING` with no message
+behind it, forever. A retry with the same `Idempotency-Key` made it worse — the fast path
+answered `200 {status: PENDING}` for a notification that would never be delivered. And
+with no publisher confirms, even a publish that "succeeded" proved nothing.
+
+**Confirms.** Every publish is now mandatory and waits for a publisher confirm
+(`publisher-confirm-type: correlated`, `publisher-returns: true`,
+`template.mandatory: true`). It counts as published only if the broker **acked** it and
+**routed** it to a queue; a nack, an unroutable return, an unreachable broker or no
+confirm within `notifications.publisher.confirm-timeout` (5s) all count as failed.
+`spring.rabbitmq.connection-timeout` (5s) bounds the attempt against a broker that hangs
+rather than refusing. On a confirmed publish the row's `published_at` is set, so a
+`PENDING` row with `published_at` null is exactly one with no message known to be on the
+broker.
+
+**What `202` means.** `202 Accepted` means **durably accepted**, not "already on the
+queue". Once the row is committed nothing fails the request: if the publish is not
+confirmed, the row stays `PENDING` with `published_at` null, the API still answers `202`,
+and the reconciler guarantees it is published later. (Answering `500` would invite a
+retry that, without an `Idempotency-Key`, creates a second notification.)
+
+**Republish.** The reconciler's sweep has a second pass: it finds `PENDING` rows with
+`published_at` null older than `publish-grace` (15s — the grace keeps it off a row whose
+`create()` is still publishing; it must exceed connection-timeout + confirm-timeout),
+and republishes each with confirms, setting `published_at` only on a confirm. Each row is
+locked (`FOR UPDATE SKIP LOCKED`), published and marked in its own short transaction, and
+the first unconfirmed publish ends the pass — the rest wait for the next sweep instead of
+each timing out. This pass also publishes the rows reclaimed from `SENDING`. Each
+confirmed republish increments `notifications.republished`.
+
+Republishing is safe even when a message for the row *is* already queued (its confirm
+was lost, not the message): the claim lets one copy deliver and skips the other — the
+[double-send contract](#the-double-send-contract) again.
+
+**Measured.** Before the fix, a failed publish on create answered `500`, the row stayed
+`PENDING` with no message, a same-key retry answered `200 PENDING`, and it was never
+delivered. After it, with `docker stop notification-rabbitmq`: 5 POSTs (3 with an
+`Idempotency-Key`) all answered `202` in 10–25ms, leaving 5 `PENDING` rows with
+`published_at` null; same-key retries answered `200 PENDING`; `unpublished_pending` read
+5 and the two sweeps during the outage each stopped at the first unconfirmed publish.
+RabbitMQ was started again and the next sweep, 24s later, republished all 5 with confirms:
+all `SENT`, each delivered once with `attempts = 1`, `republished_total` 5,
+`unpublished_pending` back to 0. With the broker up, waiting for the confirm keeps a POST
+at about 10ms.
+
+Rows created before V6 have `published_at` null and are republished once on the first
+sweep after deploy — harmless duplicates for rows already queued, and a rescue for any
+stranded by a failed publish before the fix.
+
+**Not covered here** (separate fixes): a `PENDING` row whose message was confirmed and
+then lost on the consumer side still has `published_at` set, so the republish pass does
+not touch it — a dead-letter whose `DEAD` write keeps failing until the DLQ drops it is
+exactly that case. Replaying a `DEAD` notification still does nothing.
 
 ## Tenants, API keys & rate limiting (v6)
 
@@ -380,7 +440,9 @@ Custom business metrics added in v8:
 | `notifications.pending` | gauge | — | rows in PENDING status |
 | `notifications.sending` | gauge | — | rows in SENDING status (claimed, in flight) |
 | `notifications.stuck_sending` | gauge | — | SENDING rows past their lease, awaiting the reconciler |
-| `notifications.reclaimed` | counter | — | stranded SENDING rows returned to PENDING and republished (registered at 0 on startup) |
+| `notifications.reclaimed` | counter | — | stranded SENDING rows returned to PENDING for republishing (registered at 0 on startup) |
+| `notifications.republished` | counter | — | PENDING rows with no confirmed message that the reconciler republished, counted on the broker's confirm (includes reclaimed rows; registered at 0) |
+| `notifications.unpublished_pending` | gauge | — | PENDING rows with no confirmed message, older than the publish grace |
 | `queue.depth` | gauge | queue | RabbitMQ messages in `notifications.send` / `.dlq` |
 
 The gauges are refreshed by a scheduled poller every 5s and cached, so a
@@ -489,7 +551,9 @@ queues/exchanges are declared on startup.
 Body: `{ recipient, channel, message }`. **Requires** an `X-API-Key` header
 (see [Tenants & rate limiting](#tenants-api-keys--rate-limiting-v6)). Saves as
 `PENDING`, publishes to `notifications.send`, and returns `202 Accepted` with
-`{ id, status: "PENDING" }` **immediately**.
+`{ id, status: "PENDING" }` **immediately**. `202` means durably accepted: if RabbitMQ
+does not confirm the publish, the request still succeeds and the reconciler publishes it
+later (see [Publish failures](#publish-failures-confirms-and-republish-v11)).
 
 - Missing / unknown `X-API-Key` → `401 Unauthorized`.
 - Over the tenant's per-minute budget → `429 Too Many Requests` + `Retry-After`.
@@ -683,6 +747,7 @@ without it. `prometheus.yml` has a commented `alerting:` block if you want to ad
 | **PendingBacklogHigh** `warning` | `notifications_pending > 100` for 5m | Consumers are behind. Check `queue_depth` for the work queue, that instances are alive, and whether the provider slowed down. |
 | **HighErrorRate** `warning` | failed attempts > 0.2/s for 5m | Retries may still recover these, but sustained failure leads to dead-letters. Check provider health and the recurring exception. |
 | **StuckSendingNotRecovered** `critical` | `max(notifications_stuck_sending) > 0` for 3m | Rows are past their lease but the reconciler is not reclaiming them, so they will never send. Look for `LeaseReconciler` errors (a failing sweep logs at `ERROR` each interval). |
+| **AcceptedNotificationsNotPublished** `critical` | `max(notifications_unpublished_pending) > 0` for 5m | Accepted notifications have had no confirmed message on the broker for 5 minutes — RabbitMQ is down, alarmed or unreachable. They are safe in Postgres and republish on their own once it confirms again; check `rabbitmqctl status` and the logs for `Could not publish`. |
 | **SendingLeasesReclaimedContinuously** `warning` | reclaim rate > 0 for 15m | One crash causes one burst, which is normal. A sustained rate means consumers keep dying, or sends outlive the lease (duplicate sends absorbed only by provider idempotency). Check restarts/OOMs and delivery latency vs `lease-timeout`. |
 | **TargetDown** `critical` | `up == 0` for 1m | An instance stopped being scraped. If it is the only one, the service is down. |
 | **RateLimitRejectionsSpike** `warning` | a tenant's 429 rate > 1/s for 5m | Decide: abuse (a client retrying without honouring `Retry-After`) or a tenant that needs a bigger `rate_limit_per_minute`. |
@@ -825,6 +890,8 @@ startup, before the JPA `EntityManagerFactory` is built.
 | `V2__tenant_scoped_list_indexes.sql` | Indexes for the tenant-scoped list queries. |
 | `V3__hash_api_keys.sql` | Adds `api_key_hash` (unique) and backfills it from the plaintext keys. |
 | `V4__drop_plaintext_api_key.sql` | Drops the plaintext `api_key` column. |
+| `V5__sending_lease.sql` | Adds the SENDING lease: `claim_token`, `claimed_at`, partial index for the sweep. |
+| `V6__published_at.sql` | Adds `published_at` and a partial index for unpublished `PENDING` rows. |
 
 ### `ddl-auto` is `validate`
 
@@ -947,6 +1014,11 @@ docker exec notification-postgres psql -U notifications -d notifications \
   then hangs past its lease drops its late result without touching the new holder's
   `SENT` (provider called twice, delivered once); a redelivery of a `SENT` row is still
   skipped; and a late dead-letter cannot overwrite `SENT`.
+  **Publish failures (v11):** when the broker refuses the publish on create, the POST
+  still answers `202`, the row is `PENDING` with no message, a same-key retry answers
+  `200 PENDING`, and the reconciler republishes it to `SENT` with one provider call; a
+  normal POST records `published_at`; republishing an id whose message is already queued
+  leaves two copies on the queue and still delivers once.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

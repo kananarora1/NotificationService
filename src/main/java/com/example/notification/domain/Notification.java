@@ -87,6 +87,14 @@ public class Notification {
     @Column(name = "claimed_at", insertable = false, updatable = false)
     private Instant claimedAt;
 
+    /**
+     * When the broker confirmed this row's message (publisher confirms). Null while no
+     * message for it is known to be on the broker — the reconciler republishes PENDING
+     * rows in that state. Written only by guarded UPDATEs, like the lease columns.
+     */
+    @Column(name = "published_at", insertable = false, updatable = false)
+    private Instant publishedAt;
+
     protected Notification() {
         // for JPA
     }
@@ -147,6 +155,10 @@ public class Notification {
 
     public Instant getClaimedAt() {
         return claimedAt;
+    }
+
+    public Instant getPublishedAt() {
+        return publishedAt;
     }
 
     public String getIdempotencyKey() {

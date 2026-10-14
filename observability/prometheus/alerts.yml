@@ -194,6 +194,35 @@ groups:
             Responder: look for consumer restarts/OOMs, and compare
             notifications_delivery_latency_seconds against the lease timeout.
 
+      # ---- 10. Accepted notifications are not reaching the broker. ----
+      #
+      # notifications_unpublished_pending counts PENDING rows with no confirmed message on
+      # RabbitMQ, older than the 15s publish grace: their publish on create failed (the
+      # API still answered 202) or was never confirmed. LeaseReconciler republishes them
+      # every sweep, so this only holds above 0 while the broker is not confirming
+      # publishes — RabbitMQ down, blocked by a memory/disk alarm, or unreachable. Until
+      # it clears, those notifications are accepted but not delivered.
+      #
+      # max(), not sum(): every instance reports the same table-wide count.
+      #
+      # TUNE: for: 5m — long enough not to page on a routine broker restart (the sweep
+      # recovers those within a minute or two of RabbitMQ returning), short enough that an
+      # outage pages before a meaningful backlog of silent non-deliveries builds up.
+      - alert: AcceptedNotificationsNotPublished
+        expr: max(notifications_unpublished_pending) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Accepted notifications are not being published to RabbitMQ"
+          description: >-
+            {{ $value | printf "%.0f" }} accepted notification(s) have had no confirmed
+            message on the broker for over 5 minutes. They are safe in Postgres and will
+            be republished automatically once RabbitMQ confirms publishes again.
+            Responder: check RabbitMQ is up and not in a memory/disk alarm
+            (`rabbitmqctl status`), and the app logs for "Could not publish" or
+            "No broker confirm".
+
   - name: notification-service-availability
     rules:
 

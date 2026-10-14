@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code notifications.stuck_sending} — SENDING rows past their lease, i.e. what
  *       the reconciler should be recovering. It drains every sweep, so a value that
  *       stays above zero means the reconciler itself is not working.</li>
+ *   <li>{@code notifications.unpublished_pending} — PENDING rows with no confirmed
+ *       message, past the publish grace. The reconciler republishes these every sweep, so
+ *       a value that stays above zero means the broker is not confirming publishes.</li>
  *   <li>{@code queue.depth} — RabbitMQ message counts for the work queue and the DLQ
  *       (a broker round-trip we cache).</li>
  * </ul>
@@ -43,6 +46,7 @@ public class MetricsPoller {
     private final AtomicLong pending = new AtomicLong();
     private final AtomicLong sending = new AtomicLong();
     private final AtomicLong stuckSending = new AtomicLong();
+    private final AtomicLong unpublishedPending = new AtomicLong();
     private final AtomicLong sendQueueDepth = new AtomicLong();
     private final AtomicLong dlqDepth = new AtomicLong();
 
@@ -63,6 +67,9 @@ public class MetricsPoller {
         Gauge.builder("notifications.stuck_sending", stuckSending, AtomicLong::get)
                 .description("SENDING notifications whose lease has expired, awaiting the reconciler")
                 .register(registry);
+        Gauge.builder("notifications.unpublished_pending", unpublishedPending, AtomicLong::get)
+                .description("PENDING notifications with no confirmed message past the publish grace")
+                .register(registry);
         Gauge.builder("queue.depth", sendQueueDepth, AtomicLong::get)
                 .description("Messages ready in the queue")
                 .tag("queue", RabbitConfig.SEND_QUEUE)
@@ -79,6 +86,7 @@ public class MetricsPoller {
             pending.set(repository.countByStatus(NotificationStatus.PENDING));
             sending.set(repository.countByStatus(NotificationStatus.SENDING));
             stuckSending.set(repository.countExpiredLeases(reconcilerProperties.leaseTimeout().toMillis()));
+            unpublishedPending.set(repository.countUnpublishedPending(reconcilerProperties.publishGrace().toMillis()));
             sendQueueDepth.set(queueDepth(RabbitConfig.SEND_QUEUE));
             dlqDepth.set(queueDepth(RabbitConfig.DEAD_LETTER_QUEUE));
         } catch (RuntimeException e) {
