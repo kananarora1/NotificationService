@@ -36,8 +36,7 @@ public class ApiKeyAuthInterceptor implements HandlerInterceptor {
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
         String apiKey = request.getHeader(API_KEY_HEADER);
         if (!StringUtils.hasText(apiKey)) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            return false;
+            throw new ApiAuthenticationException("Missing " + API_KEY_HEADER + " header.");
         }
 
         // Hash first, then look up by hash: a single indexed lookup, same cost as the
@@ -45,8 +44,8 @@ public class ApiKeyAuthInterceptor implements HandlerInterceptor {
         // plaintext because none exists.
         Optional<Tenant> tenant = tenants.findByApiKeyHash(ApiKeyHasher.sha256Hex(apiKey));
         if (tenant.isEmpty()) {
-            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
-            return false;
+            // Same answer for every unrecognised key: nothing about which keys exist.
+            throw new ApiAuthenticationException("Unknown API key.");
         }
 
         request.setAttribute(TENANT_ATTRIBUTE, tenant.get());

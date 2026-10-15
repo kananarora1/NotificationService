@@ -621,6 +621,29 @@ curl -s http://localhost:8080/notify/0a3d...
 }
 ```
 
+### Errors
+
+Every error is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem response,
+`Content-Type: application/problem+json`, with a `detail` that says what to change.
+Field and parameter failures also list each one under `errors`:
+
+```bash
+curl -s -H 'X-API-Key: key-acme' 'localhost:8080/notifications?status=FAILED'
+# {"type":"about:blank","title":"Bad Request","status":400,
+#  "detail":"Invalid request: 'status' has invalid value 'FAILED'; expected one of PENDING, SENDING, SENT, DEAD.",
+#  "instance":"/notifications",
+#  "errors":[{"field":"status","message":"has invalid value 'FAILED'; expected one of PENDING, SENDING, SENT, DEAD"}]}
+```
+
+| status | when | `detail` / extra fields |
+|---|---|---|
+| `400` | invalid body field, query parameter or path id; malformed JSON | names each field, the value sent and what is allowed; `errors[]` |
+| `401` | `X-API-Key` missing, or not a known key | `Missing X-API-Key header.` / `Unknown API key.` |
+| `404` | unknown notification id, or unknown endpoint | which id / which method and path |
+| `405`, `415` | wrong method / `Content-Type` | Spring's standard wording |
+| `429` | tenant over its per-minute budget | the limit and wait; `Retry-After` header and `retryAfterSeconds` |
+| `500` | anything unexpected | generic — no internals — plus an `errorId` that matches the ERROR log line with the stack trace |
+
 ## 4. Observe the queues
 
 Open the management UI at **http://localhost:15672** (guest / guest):
@@ -1021,6 +1044,11 @@ docker exec notification-postgres psql -U notifications -d notifications \
   leaves two copies on the queue and still delivers once. **Statuses:** the enum is
   exactly `PENDING`/`SENDING`/`SENT`/`DEAD`, the `CHECK` constraint allows exactly those,
   and writing `FAILED` is rejected.
+  **Errors (v12):** every error is `application/problem+json`; missing and unknown API
+  keys get distinct 401 details; bad query, path and body values name the field, the value
+  and the allowed values; every failing body field is listed and nothing is written; 429
+  carries `Retry-After`; an unexpected exception is a generic 500 whose `errorId` matches
+  the logged stack trace and whose body leaks nothing.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

@@ -89,8 +89,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.doThrow;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -205,7 +208,8 @@ class NotificationIntegrationTest {
     @Autowired
     private RecordingProvider provider;
 
-    @Autowired
+    /** Real service; a test can make one call fail unexpectedly to exercise the 500 path. */
+    @SpyBean
     private NotificationService service;
 
     @Autowired
@@ -1063,7 +1067,132 @@ class NotificationIntegrationTest {
         }
     }
 
+    // ---- v12: error responses ----
+
+    @Test
+    void missingAndUnknownApiKeysAreDistinguishedProblems() throws Exception {
+        mockMvc.perform(get("/notifications"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.detail").value("Missing X-API-Key header."));
+        mockMvc.perform(get("/notifications").header(ApiKeyAuthInterceptor.API_KEY_HEADER, "key-not-issued"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.detail").value("Unknown API key."));
+    }
+
+    @Test
+    void invalidQueryAndPathValuesNameTheParameterAndWhatIsAllowed() throws Exception {
+        mockMvc.perform(get("/notifications").param("status", "FAILED")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isBadRequest())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.errors[0].field").value("status"))
+                .andExpect(jsonPath("$.errors[0].message").value(
+                        "has invalid value 'FAILED'; expected one of PENDING, SENDING, SENT, DEAD"));
+        mockMvc.perform(get("/notifications").param("limit", "abc")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].message").value("has invalid value 'abc'; expected an integer"));
+        mockMvc.perform(get("/notify/{id}", "not-a-uuid").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("id"))
+                .andExpect(jsonPath("$.errors[0].message").value("has invalid value 'not-a-uuid'; expected a UUID"));
+    }
+
+    @Test
+    void invalidBodiesReportEveryFailingFieldAndWriteNothing() throws Exception {
+        long rowsBefore = repository.count();
+
+        mockMvc.perform(post("/notify").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"recipient\":\"\",\"channel\":\"EMAIL\",\"message\":\"\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.errors.length()").value(2))
+                .andExpect(jsonPath("$.errors[0].field").value("message"))
+                .andExpect(jsonPath("$.errors[1].field").value("recipient"));
+
+        mockMvc.perform(post("/notify").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"recipient\":\"a@example.com\",\"channel\":\"CARRIER_PIGEON\",\"message\":\"hi\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("channel"))
+                .andExpect(jsonPath("$.errors[0].message").value(
+                        "has invalid value 'CARRIER_PIGEON'; expected one of EMAIL, SMS, PUSH"));
+
+        mockMvc.perform(post("/notify").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"recipient\":"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.startsWith("Malformed JSON request body")));
+
+        assertThat(repository.count()).as("no row written for an invalid request").isEqualTo(rowsBefore);
+    }
+
+    @Test
+    void rateLimitedRequestIsAProblemWithRetryAfter() throws Exception {
+        for (int i = 0; i < 5; i++) { // initech allows 5/min
+            mockMvc.perform(notifyPost("rl-problem@example.com", INITECH_KEY)).andExpect(status().isAccepted());
+        }
+        mockMvc.perform(notifyPost("rl-problem@example.com", INITECH_KEY))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(header().exists(HttpHeaders.RETRY_AFTER))
+                .andExpect(jsonPath("$.retryAfterSeconds").isNumber())
+                .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.startsWith(
+                        "Rate limit of 5 requests per minute exceeded.")));
+    }
+
+    @Test
+    void unexpectedFailureIsAGeneric500WithAnErrorIdAndNoInternals() throws Exception {
+        doThrow(new IllegalStateException("connection to db-primary:5432 refused for user admin"))
+                .when(service).get(any(), any());
+        ListAppender<ILoggingEvent> handlerLog = captureLog(ApiExceptionHandler.class);
+        try {
+            MvcResult result = mockMvc.perform(get("/notify/{id}", UUID.randomUUID())
+                            .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                    .andExpect(status().isInternalServerError())
+                    .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                    .andExpect(jsonPath("$.errorId").isString())
+                    .andReturn();
+            String body = result.getResponse().getContentAsString();
+            assertThat(body).doesNotContain("db-primary", "admin", "IllegalStateException");
+
+            // The errorId the client sees is the one the stack trace was logged under.
+            String errorId = objectMapper.readTree(body).get("errorId").asText();
+            assertThat(messages(handlerLog)).anyMatch(m -> m.contains(errorId));
+        } finally {
+            releaseLog(ApiExceptionHandler.class, handlerLog);
+        }
+    }
+
+    @Test
+    void frameworkErrorsUseTheSameProblemFormat() throws Exception {
+        mockMvc.perform(get("/nope").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isNotFound())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.detail").value("No endpoint GET /nope."));
+        mockMvc.perform(delete("/notifications").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON));
+        mockMvc.perform(post("/notify").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .contentType(MediaType.TEXT_PLAIN).content("hello"))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON));
+    }
+
     // ---- helpers ----
+
+    private static ListAppender<ILoggingEvent> captureLog(Class<?> loggerClass) {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(loggerClass)).addAppender(appender);
+        return appender;
+    }
+
+    private static void releaseLog(Class<?> loggerClass, ListAppender<ILoggingEvent> appender) {
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(loggerClass)).detachAppender(appender);
+    }
 
     /** The status a client would see: MockMvc rethrows an unhandled exception instead of answering 500. */
     private int statusOf(MockHttpServletRequestBuilder request) throws Exception {
@@ -1082,14 +1211,11 @@ class NotificationIntegrationTest {
 
     /** Captures SimulatedProvider's log, where each "sent to …" line is one delivery. */
     private static ListAppender<ILoggingEvent> captureProviderLog() {
-        ListAppender<ILoggingEvent> appender = new ListAppender<>();
-        appender.start();
-        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(SimulatedProvider.class)).addAppender(appender);
-        return appender;
+        return captureLog(SimulatedProvider.class);
     }
 
     private static void releaseProviderLog(ListAppender<ILoggingEvent> appender) {
-        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(SimulatedProvider.class)).detachAppender(appender);
+        releaseLog(SimulatedProvider.class, appender);
     }
 
     /** Listener threads may still be logging; copy under the appender's own lock. */
