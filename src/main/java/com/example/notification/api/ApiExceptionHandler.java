@@ -75,6 +75,11 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 .body(problem);
     }
 
+    @ExceptionHandler(InvalidRequestException.class)
+    public ProblemDetail handleInvalidRequest(InvalidRequestException e) {
+        return badRequest(List.of(new FieldProblem(e.getField(), e.getMessage())));
+    }
+
     /**
      * Anything not handled above is a bug or an outage, not the client's fault. The
      * client gets a generic 500 and an id; the log gets the stack trace under that id.

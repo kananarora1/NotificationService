@@ -25,6 +25,10 @@ import java.util.UUID;
 @RequestMapping("/notify")
 public class NotificationController {
 
+    private static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+    /** The idempotency_key column is varchar(255). */
+    private static final int MAX_IDEMPOTENCY_KEY_LENGTH = 255;
+
     private final NotificationService service;
     private final NotificationMetrics metrics;
 
@@ -36,8 +40,12 @@ public class NotificationController {
     @PostMapping
     public ResponseEntity<NotifyResponse> notify(
             @Valid @RequestBody NotifyRequest request,
-            @RequestHeader(name = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestHeader(name = IDEMPOTENCY_KEY_HEADER, required = false) String idempotencyKey,
             @RequestAttribute(ApiKeyAuthInterceptor.TENANT_ATTRIBUTE) Tenant tenant) {
+        if (idempotencyKey != null && idempotencyKey.length() > MAX_IDEMPOTENCY_KEY_LENGTH) {
+            throw new InvalidRequestException(IDEMPOTENCY_KEY_HEADER,
+                    "size must be between 0 and " + MAX_IDEMPOTENCY_KEY_LENGTH);
+        }
         Notification notification = new Notification(
                 request.recipient(),
                 request.channel(),

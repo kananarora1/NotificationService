@@ -637,12 +637,15 @@ curl -s -H 'X-API-Key: key-acme' 'localhost:8080/notifications?status=FAILED'
 
 | status | when | `detail` / extra fields |
 |---|---|---|
-| `400` | invalid body field, query parameter or path id; malformed JSON | names each field, the value sent and what is allowed; `errors[]` |
+| `400` | invalid body field, query parameter, path id or `Idempotency-Key`; malformed JSON | names each field, the value sent and what is allowed; `errors[]` |
 | `401` | `X-API-Key` missing, or not a known key | `Missing X-API-Key header.` / `Unknown API key.` |
 | `404` | unknown notification id, or unknown endpoint | which id / which method and path |
 | `405`, `415` | wrong method / `Content-Type` | Spring's standard wording |
 | `429` | tenant over its per-minute budget | the limit and wait; `Retry-After` header and `retryAfterSeconds` |
 | `500` | anything unexpected | generic — no internals — plus an `errorId` that matches the ERROR log line with the stack trace |
+
+`recipient`, `message` and `Idempotency-Key` are limited to 255 characters (their column
+size), so an over-long value is a `400` naming the field rather than a failed insert.
 
 ## 4. Observe the queues
 
@@ -1046,9 +1049,11 @@ docker exec notification-postgres psql -U notifications -d notifications \
   and writing `FAILED` is rejected.
   **Errors (v12):** every error is `application/problem+json`; missing and unknown API
   keys get distinct 401 details; bad query, path and body values name the field, the value
-  and the allowed values; every failing body field is listed and nothing is written; 429
-  carries `Retry-After`; an unexpected exception is a generic 500 whose `errorId` matches
-  the logged stack trace and whose body leaks nothing.
+  and the allowed values; every failing body field is listed; over-long input is a 400
+  that writes nothing; only the idempotency constraint is treated as an idempotency race
+  (checked against real Postgres errors), and 8 concurrent same-key POSTs answer exactly
+  one 202 and seven 200s; 429 carries `Retry-After`; an unexpected exception is a generic
+  500 whose `errorId` matches the logged stack trace and whose body leaks nothing.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

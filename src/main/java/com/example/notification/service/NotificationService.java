@@ -23,6 +23,9 @@ public class NotificationService {
 
     private static final Logger log = LoggerFactory.getLogger(NotificationService.class);
 
+    /** UNIQUE (tenant_id, idempotency_key): the constraint that decides an idempotency race. */
+    static final String IDEMPOTENCY_KEY_CONSTRAINT = "uk_notifications_tenant_idempotency_key";
+
     private final NotificationRepository repository;
     private final NotificationProvider provider;
     private final NotificationPublisher publisher;
@@ -80,6 +83,11 @@ public class NotificationService {
             // (inside this try) rather than later at transaction commit.
             repository.saveAndFlush(notification);
         } catch (DataIntegrityViolationException e) {
+            if (!DataIntegrityViolations.isViolationOf(e, IDEMPOTENCY_KEY_CONSTRAINT)) {
+                // Not the race: some other constraint failed, and re-fetching by key
+                // would only report it as a missing row. Let it surface as itself.
+                throw e;
+            }
             // Lost the race: a concurrent request inserted the same key first. The
             // winner's row is committed, so re-fetch and return it without publishing.
             Notification winner = repository.findByTenantIdAndIdempotencyKey(tenantId, idempotencyKey)

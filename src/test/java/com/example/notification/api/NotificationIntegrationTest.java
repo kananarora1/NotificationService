@@ -11,6 +11,7 @@ import com.example.notification.provider.NotificationProvider;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.ratelimit.RateLimiter;
 import com.example.notification.repository.NotificationRepository;
+import com.example.notification.service.DataIntegrityViolations;
 import com.example.notification.service.NotificationService;
 import com.example.notification.support.MutableClock;
 import com.example.notification.tenant.ApiKeyHasher;
@@ -84,6 +85,7 @@ import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -395,23 +397,21 @@ class NotificationIntegrationTest {
         CountDownLatch ready = new CountDownLatch(threads);
         CountDownLatch go = new CountDownLatch(1);
         Set<UUID> ids = ConcurrentHashMap.newKeySet();
+        List<Future<Integer>> statuses = new ArrayList<>();
 
         try {
             for (int i = 0; i < threads; i++) {
-                pool.submit(() -> {
+                statuses.add(pool.submit(() -> {
                     ready.countDown();
-                    try {
-                        go.await();
-                        MvcResult r = mockMvc.perform(notifyPost(recipient, ACME_KEY)
-                                        .header("Idempotency-Key", key))
-                                .andReturn();
-                        ids.add(idFrom(r));
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                });
+                    go.await();
+                    MvcResult r = mockMvc.perform(notifyPost(recipient, ACME_KEY)
+                                    .header("Idempotency-Key", key))
+                            .andReturn();
+                    ids.add(idFrom(r));
+                    return r.getResponse().getStatus();
+                }));
             }
-            ready.await(5, TimeUnit.SECONDS);
+            assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
             go.countDown();
             pool.shutdown();
             assertThat(pool.awaitTermination(20, TimeUnit.SECONDS)).isTrue();
@@ -419,6 +419,14 @@ class NotificationIntegrationTest {
             pool.shutdownNow();
         }
 
+        // Every request succeeded: one created it (202), the rest got that row back (200).
+        // Before, a request that failed here was invisible - its exception died in the pool.
+        List<Integer> codes = new ArrayList<>();
+        for (Future<Integer> status : statuses) {
+            codes.add(status.get());
+        }
+        assertThat(codes).filteredOn(code -> code == 202).hasSize(1);
+        assertThat(codes).filteredOn(code -> code == 200).hasSize(threads - 1);
         assertThat(ids).hasSize(1);
         long rows = repository.findAll().stream()
                 .filter(n -> recipient.equals(n.getRecipient()))
@@ -1127,6 +1135,56 @@ class NotificationIntegrationTest {
                 .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.startsWith("Malformed JSON request body")));
 
         assertThat(repository.count()).as("no row written for an invalid request").isEqualTo(rowsBefore);
+    }
+
+    @Test
+    void overLongInputIsA400NotA500() throws Exception {
+        // Audit B5: these used to fail the INSERT and answer 500 - and with an
+        // Idempotency-Key the failure was misreported as a lost idempotency race.
+        long rowsBefore = repository.count();
+        String tooLong = "x".repeat(256);
+
+        mockMvc.perform(post("/notify").header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .header("Idempotency-Key", "long-" + UUID.randomUUID())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"recipient\":\"a@example.com\",\"channel\":\"EMAIL\",\"message\":\"" + tooLong + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("message"))
+                .andExpect(jsonPath("$.errors[0].message").value("size must be between 0 and 255"));
+
+        mockMvc.perform(notifyPost("a@example.com", ACME_KEY).header("Idempotency-Key", tooLong))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors[0].field").value("Idempotency-Key"))
+                .andExpect(jsonPath("$.errors[0].message").value("size must be between 0 and 255"));
+
+        // Exactly 255 still fits the column.
+        mockMvc.perform(notifyPost("a@example.com", ACME_KEY).header("Idempotency-Key", "k".repeat(255)))
+                .andExpect(status().isAccepted());
+        assertThat(repository.count()).isEqualTo(rowsBefore + 1);
+    }
+
+    @Test
+    void onlyTheIdempotencyConstraintCountsAsAnIdempotencyRace() {
+        // The real exceptions Postgres produces, classified the way create() does.
+        Notification first = new Notification("dup@example.com", Channel.EMAIL, "one");
+        first.setTenantId(tenantId(ACME_KEY));
+        first.setIdempotencyKey("dup-" + UUID.randomUUID());
+        repository.saveAndFlush(first);
+
+        Notification duplicate = new Notification("dup@example.com", Channel.EMAIL, "two");
+        duplicate.setTenantId(first.getTenantId());
+        duplicate.setIdempotencyKey(first.getIdempotencyKey());
+        DataIntegrityViolationException race = catchThrowableOfType(
+                () -> repository.saveAndFlush(duplicate), DataIntegrityViolationException.class);
+        assertThat(DataIntegrityViolations.isViolationOf(race, "uk_notifications_tenant_idempotency_key")).isTrue();
+
+        Notification tooLong = new Notification("long@example.com", Channel.EMAIL, "x".repeat(300));
+        tooLong.setIdempotencyKey("long-" + UUID.randomUUID());
+        DataIntegrityViolationException notARace = catchThrowableOfType(
+                () -> repository.saveAndFlush(tooLong), DataIntegrityViolationException.class);
+        assertThat(DataIntegrityViolations.isViolationOf(notARace, "uk_notifications_tenant_idempotency_key")).isFalse();
+
+        repository.deleteById(first.getId()); // never published; keep it away from the reconciler
     }
 
     @Test
