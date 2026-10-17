@@ -398,6 +398,27 @@ class NotificationIntegrationTest {
     }
 
     @Test
+    void reusingAnIdempotencyKeyForADifferentRequestReturnsConflict() throws Exception {
+        String key = "key-" + UUID.randomUUID();
+        UUID original = postWithKey("idem-original@example.com", key, status().isAccepted());
+
+        mockMvc.perform(post("/notify")
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY)
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"recipient":"idem-original@example.com","channel":"EMAIL","message":"different"}
+                                """))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.detail")
+                        .value("Idempotency-Key was already used with a different notification request."));
+
+        assertThat(repository.findByTenantIdAndIdempotencyKey(tenantId(ACME_KEY), key))
+                .get().extracting(Notification::getId).isEqualTo(original);
+    }
+
+    @Test
     void differentKeysCreateTwoRows() throws Exception {
         UUID a = postWithKey("two-a@example.com", "key-" + UUID.randomUUID(), status().isAccepted());
         UUID b = postWithKey("two-b@example.com", "key-" + UUID.randomUUID(), status().isAccepted());

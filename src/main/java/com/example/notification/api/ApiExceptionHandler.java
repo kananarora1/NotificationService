@@ -1,6 +1,7 @@
 package com.example.notification.api;
 
 import com.example.notification.ratelimit.RateLimitExceededException;
+import com.example.notification.service.IdempotencyConflictException;
 import com.example.notification.service.NotificationNotFoundException;
 import com.example.notification.web.ApiAuthenticationException;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -78,6 +79,11 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(InvalidRequestException.class)
     public ProblemDetail handleInvalidRequest(InvalidRequestException e) {
         return badRequest(List.of(new FieldProblem(e.getField(), e.getMessage())));
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    public ProblemDetail handleIdempotencyConflict(IdempotencyConflictException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, e.getMessage());
     }
 
     /**

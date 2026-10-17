@@ -52,7 +52,10 @@ public class NotificationService {
      * {@code (tenant_id, idempotency_key)} rather than by
      * the (TOCTOU-prone) pre-check alone: if two identical requests race, exactly
      * one INSERT succeeds and the other catches the constraint violation and returns
-     * the winner's row ({@code created = false}). Duplicates are never published.
+     * the winner's row ({@code created = false}). A key may only be retried with the
+     * same recipient, channel and message; a different request is rejected with a
+     * conflict rather than silently returning the wrong notification. Duplicates are
+     * never published.
      *
      * <p>Accepted means <b>durably</b> accepted, not "already on the queue". Once the row
      * is committed nothing here fails the request: if the publish fails or the broker
@@ -73,8 +76,7 @@ public class NotificationService {
         UUID tenantId = notification.getTenantId();
         var existing = repository.findByTenantIdAndIdempotencyKey(tenantId, idempotencyKey);
         if (existing.isPresent()) {
-            log.info("Idempotency-Key {} already maps to notification {}", idempotencyKey, existing.get().getId());
-            return CreateResult.existing(existing.get());
+            return existingOrConflict(existing.get(), notification);
         }
 
         notification.setIdempotencyKey(idempotencyKey);
@@ -93,13 +95,30 @@ public class NotificationService {
             Notification winner = repository.findByTenantIdAndIdempotencyKey(tenantId, idempotencyKey)
                     .orElseThrow(() -> new IllegalStateException(
                             "Idempotency-Key " + idempotencyKey + " violated UNIQUE but no row found", e));
-            log.info("Idempotency-Key {} race lost; returning existing notification {}",
-                    idempotencyKey, winner.getId());
-            return CreateResult.existing(winner);
+            return existingOrConflict(winner, notification);
         }
 
         publish(notification.getId());
         return CreateResult.created(notification);
+    }
+
+    /**
+     * Returns the prior result for a true retry, but never lets an accidental key reuse
+     * turn one notification request into another. This is also used after an insert
+     * race: the concurrent winner must describe the same request before it is returned.
+     */
+    private CreateResult existingOrConflict(Notification existing, Notification requested) {
+        if (!sameRequest(existing, requested)) {
+            throw new IdempotencyConflictException();
+        }
+        log.info("Returning existing notification {} for an idempotent retry", existing.getId());
+        return CreateResult.existing(existing);
+    }
+
+    private static boolean sameRequest(Notification existing, Notification requested) {
+        return Objects.equals(existing.getRecipient(), requested.getRecipient())
+                && existing.getChannel() == requested.getChannel()
+                && Objects.equals(existing.getMessage(), requested.getMessage());
     }
 
     /**
