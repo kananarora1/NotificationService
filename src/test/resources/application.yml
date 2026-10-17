@@ -2,6 +2,15 @@
 # runtime by Testcontainers (@ServiceConnection); only the bits that differ from
 # those defaults live here.
 spring:
+  lifecycle:
+    # Keep test teardown bounded. The production drain budget is intentionally long,
+    # but it can outlive Surefire's fork shutdown timeout after the containers stop.
+    timeout-per-shutdown-phase: 5s
+  task:
+    scheduling:
+      shutdown:
+        await-termination: true
+        await-termination-period: 5s
   # Tests get their schema from Flyway too, exactly like production — so the
   # migrations are exercised on every test run rather than only in deployment.
   # The Testcontainers database starts empty, so V1 runs from scratch (no baselining).
@@ -41,6 +50,10 @@ spring:
 # so the seeded tenants have to be declared here too. Same keys the docs and tests use;
 # only their SHA-256 hashes are stored.
 notifications:
+  listener:
+    # A test may end while a deliberately failing message is in retry backoff.
+    # Do not let that test-only condition hold the Spring context open for 25 seconds.
+    shutdown-timeout: 1s
   reconciler:
     # Production lease, so nothing a test has genuinely in flight is ever reclaimed;
     # tests expire a lease by backdating claimed_at instead of waiting 60s.
@@ -51,6 +64,15 @@ notifications:
     batch-size: 100
     # Production grace; tests make a row eligible by backdating created_at.
     publish-grace: 15s
+    # Production grace; tests make a retry-exhausted row eligible by backdating
+    # last_attempt_at, so the dead-letter handler always gets there first otherwise.
+    dead-grace: 60s
+  dead-letter:
+    retry:
+      max-attempts: 3
+      initial-interval: 500ms
+      multiplier: 2.0
+      max-interval: 2s
   seeding:
     enabled: true
     tenants:

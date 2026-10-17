@@ -29,10 +29,14 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code notifications.unpublished_pending} — PENDING rows with no confirmed
  *       message, past the publish grace. The reconciler republishes these every sweep, so
  *       a value that stays above zero means the broker is not confirming publishes.</li>
- *   <li>{@code queue.depth} — RabbitMQ message counts for the work queue and the DLQ
- *       (a broker round-trip we cache).</li>
+ *   <li>{@code queue.depth} — RabbitMQ message counts for the work queue, the DLQ and the
+ *       parking lot (a broker round-trip we cache). Nothing consumes the parking lot, so
+ *       any depth there is a dead-letter waiting for a person.</li>
  * </ul>
- * The gauges read cheap {@link AtomicLong}s; a scheduled task updates them every 5s.
+ * The gauges read cheap {@link AtomicLong}s, updated every 5s by two scheduled tasks: one
+ * for the database counts, one for the queue depths. They are separate because a Postgres
+ * outage is exactly when the parking lot fills, and while Postgres hangs every query
+ * takes the pool's 30s connection timeout to fail — the depths must not wait behind them.
  */
 @Component
 public class MetricsPoller {
@@ -49,6 +53,7 @@ public class MetricsPoller {
     private final AtomicLong unpublishedPending = new AtomicLong();
     private final AtomicLong sendQueueDepth = new AtomicLong();
     private final AtomicLong dlqDepth = new AtomicLong();
+    private final AtomicLong parkingLotDepth = new AtomicLong();
 
     public MetricsPoller(MeterRegistry registry,
                          NotificationRepository repository,
@@ -78,20 +83,34 @@ public class MetricsPoller {
                 .description("Messages ready in the queue")
                 .tag("queue", RabbitConfig.DEAD_LETTER_QUEUE)
                 .register(registry);
+        Gauge.builder("queue.depth", parkingLotDepth, AtomicLong::get)
+                .description("Messages ready in the queue")
+                .tag("queue", RabbitConfig.PARKING_LOT_QUEUE)
+                .register(registry);
     }
 
+    // Never let a metrics refresh failure disrupt the app; keep the last values.
+
     @Scheduled(fixedRate = 5000)
-    public void poll() {
+    public void pollDatabase() {
         try {
             pending.set(repository.countByStatus(NotificationStatus.PENDING));
             sending.set(repository.countByStatus(NotificationStatus.SENDING));
             stuckSending.set(repository.countExpiredLeases(reconcilerProperties.leaseTimeout().toMillis()));
             unpublishedPending.set(repository.countUnpublishedPending(reconcilerProperties.publishGrace().toMillis()));
+        } catch (RuntimeException e) {
+            log.warn("Failed to refresh the database gauges", e);
+        }
+    }
+
+    @Scheduled(fixedRate = 5000)
+    public void pollQueues() {
+        try {
             sendQueueDepth.set(queueDepth(RabbitConfig.SEND_QUEUE));
             dlqDepth.set(queueDepth(RabbitConfig.DEAD_LETTER_QUEUE));
+            parkingLotDepth.set(queueDepth(RabbitConfig.PARKING_LOT_QUEUE));
         } catch (RuntimeException e) {
-            // Never let a metrics refresh failure disrupt the app; keep the last values.
-            log.warn("Failed to refresh metric gauges", e);
+            log.warn("Failed to refresh the queue depth gauges", e);
         }
     }
 

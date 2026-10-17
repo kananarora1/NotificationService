@@ -70,6 +70,37 @@ groups:
             the app logs for DeadLetterListener exceptions and confirm the queue still
             has consumers (`rabbitmqctl list_queues name messages consumers`).
 
+      # ---- 2b. A dead-letter reached the end of the line. ----
+      #
+      # notifications.parking-lot receives a message only when DeadLetterListener could
+      # not record it as DEAD even after its own retries — in practice, Postgres was down
+      # while notifications were exhausting their retries. Nothing consumes the parking
+      # lot, so the depth never falls by itself: every message there waits for a person.
+      # A row that reached its retry limit is marked DEAD by LeaseReconciler once
+      # Postgres is back (notifications_dead_reconciled_total). A row whose retries were
+      # spent on the outage itself (its claims failed, so attempts stayed below the limit)
+      # stays PENDING and is only delivered once its parked message is replayed.
+      #
+      # max(), not sum(): every instance reports the same broker-wide depth.
+      #
+      # TUNE: > 0 for 1m. There is no normal non-zero value; the 1m only rides out a
+      # scrape gap.
+      - alert: ParkedDeadLetters
+        expr: max(queue_depth{queue="notifications.parking-lot"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-letters are parked and need a person"
+          description: >-
+            {{ $value | printf "%.0f" }} message(s) are in notifications.parking-lot: their
+            notification exhausted its retries and the dead-letter handler could not
+            record it as DEAD. Responder: check the app logs for DeadLetterListener errors
+            (usually a Postgres outage). Once Postgres is healthy, look up each parked id:
+            a DEAD row is accounted for and its message can be purged; a row still
+            PENDING has not been delivered and its message must be replayed (see
+            "Parked dead-letters" in the README).
+
       # ---- 3. Consumers are falling behind the producers. ----
       #
       # TUNE: 100 pending rows. At 16 consumers x ~800ms per send the service clears

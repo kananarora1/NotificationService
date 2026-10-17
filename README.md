@@ -93,13 +93,19 @@ POST /notify ─► save PENDING ─► publish id ─► 202 {id, PENDING}
                       RabbitMQ durable queue "notifications.dlq"
                                          │
                               DeadLetterListener ─► status DEAD + failureReason
+                                         │
+                                  DEAD write still failing after 3 tries → reject
+                                         │  via the DLQ's own x-dead-letter-exchange
+                                         ▼
+                 RabbitMQ durable queue "notifications.parking-lot"  (no consumer)
 ```
 
 - **Work queue** — `RabbitConfig` declares `notifications.send` (`durable`),
   configured with `x-dead-letter-exchange` → `notifications.dlx` so rejected
   messages are dead-lettered.
 - **Dead-letter topology** — a durable direct exchange `notifications.dlx` and a
-  durable queue `notifications.dlq` bound to it.
+  durable queue `notifications.dlq` bound to it. The DLQ dead-letters in turn, to the
+  durable `notifications.parking-lot` on the same exchange, which nothing consumes.
 - **Producer** — `NotificationPublisher` publishes the id via `RabbitTemplate`
   (persistent delivery). `NotificationService.create()` saves the row, then publishes.
 - **Consumer** — `NotificationListener` calls `attemptDelivery(id)`, which
@@ -110,7 +116,9 @@ POST /notify ─► save PENDING ─► publish id ─► 202 {id, PENDING}
   (see below). When `max-attempts` is reached, the message is rejected **without
   requeue** and RabbitMQ routes it to the DLQ.
 - **DLQ consumer** — `DeadLetterListener` listens on `notifications.dlq`, marks the
-  row `DEAD`, records a `failureReason`, and logs the id and reason.
+  row `DEAD`, records a `failureReason`, and logs the id and reason. It has its own
+  container factory — one consumer, 3 attempts — and parks what it cannot record (see
+  [Dead-letters that cannot be recorded](#dead-letters-that-cannot-be-recorded-v13)).
 
 ### Retry configuration (`application.yml`)
 
@@ -312,8 +320,92 @@ stranded by a failed publish before the fix.
 
 **Not covered here** (separate fixes): a `PENDING` row whose message was confirmed and
 then lost on the consumer side still has `published_at` set, so the republish pass does
-not touch it — a dead-letter whose `DEAD` write keeps failing until the DLQ drops it is
-exactly that case. Replaying a `DEAD` notification still does nothing.
+not touch it. The case that mattered — a dead-letter whose `DEAD` write keeps failing —
+is fixed in v13, below. Replaying a `DEAD` notification still does nothing.
+
+## Dead-letters that cannot be recorded (v13)
+
+**The bug.** After its last failed attempt a row is `PENDING` with `attempts = 4`, its
+message goes to `notifications.dlq`, and `DeadLetterListener` writes `DEAD`. If that
+write failed, the DLQ listener retried it (on the work queue's container factory: 4
+attempts, up to 32 consumers), then rejected the message — and `notifications.dlq` had
+no dead-letter exchange, so RabbitMQ **discarded** it. The row stayed `PENDING` forever:
+it has a confirmed message, so the republish pass skips it. `notifications.dead` never
+incremented (the exception came first) and the DLQ drained to 0, so neither
+`DeadLetterGrowing` nor `DeadLetterQueueNotDraining` could fire. The trigger is a
+correlated outage: Postgres down fails every send, so the DLQ floods exactly when every
+`DEAD` write fails too.
+
+Reproduced first, by a test that makes every `DEAD` write for one `fail@example.com`
+throw: `markDead` was called 4 times, the row was left `PENDING` with `attempts = 4`,
+`notifications.dead` +0, DLQ depth 0, and the message was nowhere — it had been dropped.
+
+**Nothing is discarded any more.** Two safety nets, one on each side:
+
+- **Broker side: the parking lot.** `notifications.dlq` now dead-letters to the durable
+  `notifications.parking-lot`. When the DLQ listener gives up, the message moves there
+  instead of vanishing. Nothing consumes the parking lot; it waits for a person (see
+  [Parked dead-letters](#parked-dead-letters)), its depth is the
+  `queue.depth{queue="notifications.parking-lot"}` gauge, and `ParkedDeadLetters`
+  (critical) fires when it is above 0.
+- **Database side: the reconciler.** Each sweep marks `DEAD` the `PENDING` rows that
+  have used up their retries (`attempts >= retry.max-attempts`) and whose last attempt
+  began more than `dead-grace` (60s) ago — once Postgres is back, every row that failed
+  its last delivery attempt but could not be recorded `DEAD`. The new `last_attempt_at` column (V8, stamped by the claim) dates the
+  last attempt, since `claimed_at` is cleared when an attempt releases its claim. These
+  count in `notifications.dead` like any other `DEAD` (so `DeadLetterGrowing` sees them)
+  and in `notifications.dead_reconciled`. The pass runs after the reclaim pass, so a row
+  reclaimed from `SENDING` on its last attempt is marked `DEAD` rather than retried again.
+
+**The DLQ listener has its own container factory**: one consumer, prefetch 1, and a
+short retry (`notifications.dead-letter.retry.*`: 3 attempts, 0.5s then 1s), instead of
+the work queue's 16–32 consumers and 4 attempts. In a Postgres outage that is about one
+write a second against the dead database rather than four per message across 16
+consumers, and each message parks within ~1.5s. Whatever is still in the DLQ when
+Postgres returns is recorded normally.
+
+**Both `DEAD` writes are guarded on `status = 'PENDING'`**, so neither can overwrite a
+`SENT` row, nor a `SENDING` one: a `SENDING` row has a delivery in flight, and if that
+consumer has died the lease reclaim returns it to `PENDING` first. Whichever write gets
+there first wins; the other matches no row, so a notification is counted `DEAD` once.
+`notifications.dead` is incremented only after the write succeeds. A dead-letter for a
+row that no longer exists is logged and acknowledged — there is nothing to record, and
+nothing for a person to look at.
+
+Rows stranded this way before V8 have `last_attempt_at` NULL, which the sweep reads as
+`created_at`, so the first sweep after deploy marks them `DEAD`.
+
+**Measured** on a throwaway stack, with a trigger making every `DEAD` write fail:
+
+- **Before (v12):** 2 `fail@example.com` rows were left `PENDING` with `attempts = 4`.
+  The DLQ, served by 16 consumers, tried each `DEAD` write 4 times, then both messages
+  were gone from every queue, and `notifications_dead_total` did not exist.
+- **After:** 3 rows. The single DLQ consumer tried each write 3 times, and all 3
+  messages were parked within 5s (`queue_depth{queue="notifications.parking-lot"}` 3).
+  With the trigger dropped, the reconciler marked all 3 `DEAD` 42s later (60s after
+  their last attempt), and `notifications_dead_total` and
+  `notifications_dead_reconciled_total` each reached 3.
+- **Upgrade:** the 2 rows the old version had stranded were marked `DEAD` by the first
+  sweeps after V8.
+- **`docker pause` on Postgres** mid-delivery: every database call failed after the
+  pool's 30s timeout, so the 2 messages reached the DLQ after ~90s and parked after
+  ~4 minutes.
+  - Both rows were `PENDING` with `attempts = 2`: the outage itself had spent their
+    retries at the claim, so the reconciler rightly left them alone.
+  - Replaying the 2 parked ids onto `notifications.send` gave each 4 more attempts, and
+    the listener recorded both `DEAD`.
+
+> **Upgrading an existing broker:** v13 adds dead-letter arguments to
+> `notifications.dlq`, and RabbitMQ refuses to redeclare a queue with different
+> arguments. Stop the app, check the DLQ is empty (`rabbitmqctl list_queues name
+> messages`), delete it — `docker exec notification-rabbitmq rabbitmqctl delete_queue
+> notifications.dlq` — and start the new version, which declares it again.
+>
+> Skipping this used to go unnoticed: Spring AMQP only logs the refused redeclare, so
+> the app reported healthy while running on the old DLQ — no parking lot, the bug still
+> there. On startup `QueueArgumentsCheck` now redeclares every queue itself and **refuses
+> to start** if one exists with different arguments, naming the queue and these steps.
+> A broker that is down at startup is not an error; the queues are declared on connect.
 
 ## Tenants, API keys & rate limiting (v6)
 
@@ -432,7 +524,8 @@ Custom business metrics added in v8:
 | `notifications.submitted` | counter | tenant, channel | notification accepted & created |
 | `notifications.sent` | counter | tenant, channel | delivered successfully |
 | `notifications.failed_attempt` | counter | tenant | a delivery attempt failed (fires on **every** attempt, incl. retries) |
-| `notifications.dead` | counter | tenant | dead-lettered (retries exhausted) |
+| `notifications.dead` | counter | tenant | recorded `DEAD` (retries exhausted), by the DLQ listener or the reconciler; counted only once the write succeeds |
+| `notifications.dead_reconciled` | counter | — | the subset of `notifications.dead` the reconciler wrote because the DLQ listener could not (registered at 0) |
 | `ratelimit.rejected` | counter | tenant | request rejected with 429 |
 | `notifications.delivery.latency` | timer | — | duration of a `provider.send()` call |
 | `notifications.end_to_end.latency` | timer | — | accepted (`createdAt`) → sent (`sentAt`) |
@@ -442,11 +535,13 @@ Custom business metrics added in v8:
 | `notifications.reclaimed` | counter | — | stranded SENDING rows returned to PENDING for republishing (registered at 0 on startup) |
 | `notifications.republished` | counter | — | PENDING rows with no confirmed message that the reconciler republished, counted on the broker's confirm (includes reclaimed rows; registered at 0) |
 | `notifications.unpublished_pending` | gauge | — | PENDING rows with no confirmed message, older than the publish grace |
-| `queue.depth` | gauge | queue | RabbitMQ messages in `notifications.send` / `.dlq` |
+| `queue.depth` | gauge | queue | RabbitMQ messages in `notifications.send` / `.dlq` / `.parking-lot` |
 
 The gauges are refreshed by a scheduled poller every 5s and cached, so a
 Prometheus scrape never triggers a `COUNT(*)` on a large table or a broker
-round-trip. Per-tenant metrics are tagged with the tenant **name** (e.g. `acme`).
+round-trip. The database counts and the queue depths refresh on separate scheduled tasks
+(each with its own scheduler thread), so the queue gauges stay live while Postgres is down
+or hanging — exactly when the parking lot fills. Per-tenant metrics are tagged with the tenant **name** (e.g. `acme`).
 
 ### Grafana dashboard
 
@@ -525,6 +620,8 @@ This starts:
 > `notifications.send` queue. RabbitMQ refuses to redeclare an existing queue with
 > different arguments, so if you ran v3 against a persistent broker, delete the old
 > queue first: `docker exec notification-rabbitmq rabbitmqctl delete_queue notifications.send`.
+> v13 does the same to `notifications.dlq`: with the app stopped and the DLQ empty,
+> `docker exec notification-rabbitmq rabbitmqctl delete_queue notifications.dlq`.
 
 ## 2. Run the app
 
@@ -658,6 +755,9 @@ Open the management UI at **http://localhost:15672** (guest / guest):
   before posting `fail@example.com`, the dead-lettered message accumulates here
   (Ready count > 0) instead of being consumed, proving it isn't dropped. With the
   app running, the DLQ consumer drains it and marks the row `DEAD`.
+- **Queues → `notifications.parking-lot`** — dead-letters the DLQ consumer could not
+  record as `DEAD`. Normally empty, and nothing drains it: see
+  [Parked dead-letters](#parked-dead-letters).
 
 From the CLI:
 
@@ -684,6 +784,41 @@ The work queue's consumer will pick it up and retry from scratch. (If the
 underlying cause is permanent — e.g. `fail@example.com` — it will simply be
 dead-lettered again.) For a real system you'd typically fix the root cause first,
 then replay in bulk via the Shovel plugin or a small admin endpoint.
+
+### Parked dead-letters
+
+A message in `notifications.parking-lot` means a notification's message used up its
+retries and the DLQ consumer could not write `DEAD` (Postgres down, typically). Once
+Postgres is healthy, look up each parked id:
+
+- **`DEAD`**, `failure_reason` naming the reconciler — the row had reached its retry
+  limit and the reconciler recorded it (within `dead-grace` plus a sweep). Accounted
+  for; purge the message.
+- **still `PENDING`** — the retries were spent on the outage itself: each attempt's
+  claim failed against the database, so `attempts` never reached the limit and neither
+  reconciler pass touches the row (its message was confirmed, then parked). It has not
+  been delivered. Replay it: a `PENDING` row is picked up by a plain re-publish onto
+  `notifications.send` (as in the replay above) and gets a full set of attempts.
+
+```bash
+# how many, and which ids (requeue=true leaves them parked)
+docker exec notification-rabbitmq rabbitmqctl list_queues name messages
+docker exec notification-rabbitmq \
+  rabbitmqadmin get queue=notifications.parking-lot count=10 ackmode=ack_requeue_true
+# check each row
+docker exec notification-postgres psql -U notifications -d notifications \
+  -c "select id, status, attempts, failure_reason from notifications where id in ('…')"
+# replay each one still PENDING
+docker exec notification-rabbitmq \
+  rabbitmqadmin publish exchange=amq.default routing_key=notifications.send payload='…'
+# once every parked id is accounted for, clear them
+docker exec notification-rabbitmq rabbitmqctl purge_queue notifications.parking-lot
+```
+
+`ParkingLot.replayOne()` takes one parked message and sends its notification through
+delivery again from scratch (`NotificationService.requeueForDelivery`: back to `PENDING`
+with attempts and failure reason cleared, then published); a row already `SENT` or in
+flight is left alone and the message is just acknowledged. No endpoint calls it yet.
 
 ## Operations
 
@@ -768,6 +903,7 @@ without it. `prometheus.yml` has a commented `alerting:` block if you want to ad
 | alert | fires when | what a responder does |
 |---|---|---|
 | **DeadLetterGrowing** `critical` | any notification was dead-lettered in the last 10m (`for: 2m`) | These gave up and will **not** retry themselves. Read `failure_reason` on the `DEAD` rows, fix the cause, then replay onto `notifications.send`. |
+| **ParkedDeadLetters** `critical` | `max(queue_depth{queue="notifications.parking-lot"}) > 0` for 1m | The DLQ consumer could not record dead-letters as `DEAD` — usually a Postgres outage. Check the logs, confirm the rows have since been marked `DEAD` (`notifications_dead_reconciled_total`), then replay or purge the parked messages ([Parked dead-letters](#parked-dead-letters)). |
 | **DeadLetterQueueNotDraining** `critical` | `notifications.dlq` depth > 0 for 5m | `DeadLetterListener` is stuck or down, so failures are no longer being recorded as `DEAD`. Check the app logs and `rabbitmqctl list_queues name messages consumers`. |
 | **PendingBacklogHigh** `warning` | `notifications_pending > 100` for 5m | Consumers are behind. Check `queue_depth` for the work queue, that instances are alive, and whether the provider slowed down. |
 | **HighErrorRate** `warning` | failed attempts > 0.2/s for 5m | Retries may still recover these, but sustained failure leads to dead-letters. Check provider health and the recurring exception. |
@@ -1054,6 +1190,18 @@ docker exec notification-postgres psql -U notifications -d notifications \
   (checked against real Postgres errors), and 8 concurrent same-key POSTs answer exactly
   one 202 and seven 200s; 429 carries `Retry-After`; an unexpected exception is a generic
   500 whose `errorId` matches the logged stack trace and whose body leaks nothing.
+  **Unrecordable dead-letters (v13):** with every `DEAD` write for a `fail@example.com`
+  failing, the DLQ listener tries 3 times and the message lands in
+  `notifications.parking-lot` (before the fix: 4 tries, then discarded) while the row
+  stays `PENDING`; once writes work and the dead grace has passed, the reconciler marks
+  it `DEAD`, `notifications.dead` and `notifications.dead_reconciled` each +1, and the
+  parked message stays. A message parked straight from the DLQ shows in the
+  `queue.depth` gauge and the Prometheus scrape; a dead-letter for a missing row is
+  acknowledged once, not parked; neither `DEAD` write touches a `SENT` or `SENDING` row,
+  and the reconciler leaves an exhausted row alone inside the grace; `ParkingLot.replayOne()`
+  sends a parked `DEAD` notification through delivery again (`SENT`, `attempts = 1`) and
+  only acknowledges a parked `SENT` one; and startup refuses a queue the broker already
+  has with different arguments, naming the `delete_queue` fix.
 - `ConfigSecretsTest` — no Spring context, no containers. Reads the real
   `application.yml`, `.env.example` and `.gitignore` and fails if a credential stops
   being a `${ENV_VAR:default}` placeholder, if a variable the app reads is undocumented

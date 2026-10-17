@@ -25,6 +25,7 @@ public class NotificationMetrics {
     private final ConcurrentHashMap<UUID, String> tenantNameCache = new ConcurrentHashMap<>();
     private final Counter reclaimed;
     private final Counter republished;
+    private final Counter deadReconciled;
 
     public NotificationMetrics(MeterRegistry registry, TenantRepository tenants) {
         this.registry = registry;
@@ -37,6 +38,9 @@ public class NotificationMetrics {
                 .register(registry);
         this.republished = Counter.builder("notifications.republished")
                 .description("PENDING rows with no confirmed message that the reconciler republished, confirmed")
+                .register(registry);
+        this.deadReconciled = Counter.builder("notifications.dead_reconciled")
+                .description("Retry-exhausted rows the reconciler marked DEAD because the dead-letter handler could not")
                 .register(registry);
     }
 
@@ -55,7 +59,10 @@ public class NotificationMetrics {
         registry.counter("notifications.failed_attempt", "tenant", tenant).increment();
     }
 
-    /** A notification was dead-lettered (retries exhausted). */
+    /**
+     * A notification was recorded DEAD (retries exhausted), by the dead-letter handler or
+     * the reconciler. Counted only after the DEAD write succeeds.
+     */
     public void dead(String tenant) {
         registry.counter("notifications.dead", "tenant", tenant).increment();
     }
@@ -63,6 +70,14 @@ public class NotificationMetrics {
     /** The reconciler returned stranded SENDING rows to PENDING (they are then republished). */
     public void reclaimed(int count) {
         reclaimed.increment(count);
+    }
+
+    /**
+     * The reconciler marked retry-exhausted rows DEAD that the dead-letter handler never
+     * recorded. Each is also counted in {@link #dead}, which covers both paths.
+     */
+    public void deadReconciled(int count) {
+        deadReconciled.increment(count);
     }
 
     /**

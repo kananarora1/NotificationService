@@ -221,19 +221,44 @@ public class NotificationService {
      * Marks a notification permanently failed after it has been dead-lettered. Only a
      * PENDING row qualifies (see {@link NotificationRepository#markDead}): if another
      * delivery has since claimed or completed it, the late dead-letter is logged and
-     * ignored rather than overwriting that outcome.
+     * ignored rather than overwriting that outcome. A dead-letter for a row that no longer
+     * exists has nothing to record and is ignored too.
+     *
+     * <p>A database failure propagates, so the dead-letter handler retries and then parks
+     * the message (see {@code RabbitConfig}). {@code notifications.dead} is counted only
+     * once DEAD is written.
      */
     public void markDead(UUID id, String reason) {
         if (repository.markDead(id, reason) == 0) {
-            Notification current = repository.findById(id)
-                    .orElseThrow(() -> new NotificationNotFoundException(id));
-            log.warn("Ignoring dead-letter for {}: it is {}, not PENDING", id, current.getStatus());
+            repository.findById(id).ifPresentOrElse(
+                    current -> log.warn("Ignoring dead-letter for {}: it is {}, not PENDING", id, current.getStatus()),
+                    () -> log.warn("Ignoring dead-letter for {}: no such notification", id));
             return;
         }
         Notification dead = repository.findById(id)
                 .orElseThrow(() -> new NotificationNotFoundException(id));
         metrics.dead(metrics.tenantName(dead.getTenantId()));
         log.warn("Notification {} dead-lettered after {} attempts: {}", id, dead.getAttempts(), reason);
+    }
+
+    /**
+     * Sends a DEAD notification (or one stranded PENDING past its retries) through
+     * delivery again from scratch: the row goes back to PENDING with its attempts and
+     * failure reason cleared, and its id is published onto {@code notifications.send}.
+     * An unconfirmed publish is left to the reconciler, as on create.
+     *
+     * @return false, changing nothing, if the row is missing, in flight (SENDING) or
+     * already SENT
+     */
+    public boolean requeueForDelivery(UUID id) {
+        if (repository.resetForRedelivery(id) == 0) {
+            log.info("Not requeueing {}: {}", id, repository.findById(id)
+                    .map(n -> "it is " + n.getStatus()).orElse("no such notification"));
+            return false;
+        }
+        log.info("Requeued notification {} for delivery", id);
+        publish(id);
+        return true;
     }
 
     /**

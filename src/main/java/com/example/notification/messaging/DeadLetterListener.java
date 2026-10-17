@@ -14,6 +14,11 @@ import java.util.UUID;
  * {@code notifications.dlq}. It records the permanent failure by flipping the
  * notification's status to DEAD and storing a {@code failureReason}, so a
  * dead-lettered notification is never silently dropped.
+ *
+ * <p>Runs on its own container factory: one consumer and a short retry (see
+ * {@link RabbitConfig#deadLetterContainerFactory}). If the DEAD write still fails, the
+ * message is rejected and the broker moves it to {@code notifications.parking-lot};
+ * {@code LeaseReconciler} marks the row DEAD once the database is back.
  */
 @Component
 public class DeadLetterListener {
@@ -24,7 +29,8 @@ public class DeadLetterListener {
         this.service = service;
     }
 
-    @RabbitListener(queues = RabbitConfig.DEAD_LETTER_QUEUE)
+    @RabbitListener(queues = RabbitConfig.DEAD_LETTER_QUEUE,
+            containerFactory = RabbitConfig.DEAD_LETTER_CONTAINER_FACTORY)
     public void onDeadLetter(String notificationId,
                              @Header(name = "x-death", required = false) List<Map<String, ?>> xDeath) {
         service.markDead(UUID.fromString(notificationId), describe(xDeath));

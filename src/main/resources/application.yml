@@ -4,10 +4,12 @@ spring:
   task:
     scheduling:
       pool:
-        # Two threads, not Boot's default of one: MetricsPoller and LeaseReconciler are
-        # both @Scheduled. On one thread a hung sweep would also freeze the gauges —
-        # including notifications.stuck_sending, the one that detects a hung sweep.
-        size: 2
+        # One thread per @Scheduled task, not Boot's default of one for all: LeaseReconciler's
+        # sweep and MetricsPoller's database and queue polls. On a shared thread a hung sweep
+        # would also freeze the gauges — including notifications.stuck_sending, the one that
+        # detects a hung sweep — and while Postgres hangs, the database poll would hold up
+        # the parking-lot depth that should be alerting.
+        size: 3
   lifecycle:
     # Budget for EACH SmartLifecycle shutdown phase (the web server's drain and the
     # RabbitMQ listener's drain are separate phases, so worst case is roughly two of
@@ -111,6 +113,21 @@ notifications:
     # An unpublished PENDING row younger than this is left alone: its create() may still
     # be publishing it. Must exceed connection-timeout + publisher.confirm-timeout (10s).
     publish-grace: ${RECONCILER_PUBLISH_GRACE:15s}
+    # A PENDING row that has used up its retries (attempts >= retry.max-attempts) and
+    # whose last attempt began longer ago than this is marked DEAD by the reconciler: its
+    # dead-letter handler could not write DEAD. Must exceed one provider call plus the
+    # dead-letter retry below (~1.5s), so the handler normally records it first.
+    dead-grace: ${RECONCILER_DEAD_GRACE:60s}
+  dead-letter:
+    # The notifications.dlq listener's own retry, separate from the work queue's (see
+    # RabbitConfig.deadLetterContainerFactory). After the last attempt the message is
+    # parked in notifications.parking-lot, never dropped. Kept short: these attempts
+    # mostly fail together, during a Postgres outage.
+    retry:
+      max-attempts: 3
+      initial-interval: 500ms
+      multiplier: 2.0
+      max-interval: 2s
   seeding:
     # Local-development convenience: ensures these tenants exist on startup, storing
     # only the SHA-256 hash of each key. Set SEED_TENANTS_ENABLED=false in production

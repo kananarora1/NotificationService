@@ -21,8 +21,8 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     /**
      * Atomically claims a notification for delivery (PENDING -> SENDING) in a single
      * conditional UPDATE, taking a lease: the caller's {@code token} and the database's
-     * {@code now()} are stamped on the row, and the attempt counter is incremented in the
-     * same statement. Returns 1 if this caller won the claim, 0 if the row is missing,
+     * {@code now()} are stamped on the row (as the lease start and as
+     * {@code last_attempt_at}), and the attempt counter is incremented in the same statement. Returns 1 if this caller won the claim, 0 if the row is missing,
      * already claimed by another consumer, or already terminal.
      *
      * <p>The precondition lives in the WHERE clause deliberately: reading the status
@@ -33,7 +33,8 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Modifying(clearAutomatically = true)
     @Query(value = """
             update notifications
-               set status = 'SENDING', claim_token = :token, claimed_at = now(), attempts = attempts + 1
+               set status = 'SENDING', claim_token = :token, claimed_at = now(), last_attempt_at = now(),
+                   attempts = attempts + 1
              where id = :id and status = 'PENDING'
             """, nativeQuery = true)
     int claimForSending(@Param("id") UUID id, @Param("token") UUID token);
@@ -113,6 +114,55 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
              where id in (:ids) and status = 'SENDING'
             """, nativeQuery = true)
     int reclaim(@Param("ids") Collection<UUID> ids);
+
+    /**
+     * Locks up to {@code limit} PENDING rows that have used up their retries
+     * ({@code attempts >= maxAttempts}) and whose last attempt began more than
+     * {@code graceMillis} ago — rows whose dead-letter never got DEAD written. A row with
+     * no recorded attempt time (attempted before V8) is aged by {@code created_at}.
+     * {@code SKIP LOCKED}, like the lease sweep; must run inside the caller's transaction.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Query(value = """
+            select id from notifications
+             where status = 'PENDING' and attempts >= :maxAttempts
+               and coalesce(last_attempt_at, created_at) < now() - :graceMillis * interval '1 millisecond'
+             order by coalesce(last_attempt_at, created_at)
+             limit :limit
+             for update skip locked
+            """, nativeQuery = true)
+    List<UUID> lockExhaustedPending(@Param("maxAttempts") int maxAttempts,
+                                    @Param("graceMillis") long graceMillis,
+                                    @Param("limit") int limit);
+
+    /**
+     * Marks locked, retry-exhausted rows DEAD. Guarded like {@link #markDead}: only a row
+     * still PENDING changes, so this and the dead-letter handler never both record one.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set status = 'DEAD', failure_reason = :reason
+             where id in (:ids) and status = 'PENDING'
+            """, nativeQuery = true)
+    int markExhaustedDead(@Param("ids") Collection<UUID> ids, @Param("reason") String reason);
+
+    /**
+     * Gives a DEAD or retry-exhausted PENDING row a fresh start: PENDING, attempts and
+     * failure reason cleared, and published_at cleared so that, if the caller's publish
+     * is not confirmed, the reconciler republishes it. SENDING and SENT rows are left
+     * alone (in flight, or already delivered); returns 0 for them.
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set status = 'PENDING', attempts = 0, failure_reason = null,
+                   claim_token = null, claimed_at = null, published_at = null, last_attempt_at = null
+             where id = :id and status in ('PENDING', 'DEAD')
+            """, nativeQuery = true)
+    int resetForRedelivery(@Param("id") UUID id);
 
     /**
      * Records that the broker confirmed this row's message. Only fills an empty value, so

@@ -95,6 +95,10 @@ public class Notification {
     @Column(name = "published_at", insertable = false, updatable = false)
     private Instant publishedAt;
 
+    /** When the latest delivery attempt claimed the row (database clock); null if never attempted. */
+    @Column(name = "last_attempt_at", insertable = false, updatable = false)
+    private Instant lastAttemptAt;
+
     protected Notification() {
         // for JPA
     }
@@ -155,6 +159,10 @@ public class Notification {
 
     public Instant getPublishedAt() {
         return publishedAt;
+    }
+
+    public Instant getLastAttemptAt() {
+        return lastAttemptAt;
     }
 
     public String getIdempotencyKey() {

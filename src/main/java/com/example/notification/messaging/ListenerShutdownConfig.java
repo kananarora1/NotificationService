@@ -56,8 +56,9 @@ public class ListenerShutdownConfig {
 
     /**
      * Applied by Spring Boot to the auto-configured
-     * {@code SimpleRabbitListenerContainerFactory}, so it reaches every
-     * {@code @RabbitListener} — the work queue and the DLQ alike.
+     * {@code SimpleRabbitListenerContainerFactory} (the work queue), and by
+     * {@link RabbitConfig#deadLetterContainerFactory} to the DLQ's own factory, so every
+     * {@code @RabbitListener} drains the same way.
      */
     @Bean
     public ContainerCustomizer<SimpleMessageListenerContainer> gracefulListenerShutdown() {

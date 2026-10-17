@@ -5,6 +5,7 @@ import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.repository.NotificationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.amqp.RabbitProperties;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -21,11 +22,18 @@ import java.util.UUID;
  *       writing SENT (kill -9, OOM, a DB error after the claim) leaves it SENDING, and
  *       the broker's redelivery skips it because it is already claimed. Rows whose lease
  *       has expired go back to PENDING with {@code published_at} cleared.</li>
+ *   <li><b>Retry-exhausted PENDING rows.</b> After its last failed attempt a row is
+ *       PENDING with {@code attempts} at the retry limit, and the dead-letter handler
+ *       writes DEAD. If that write keeps failing (Postgres down) the handler parks the
+ *       message, and nothing else would ever finish the row: it has a confirmed message,
+ *       so step 3 skips it. Rows at the limit whose last attempt is older than the dead
+ *       grace are marked DEAD here, once the database is reachable again.</li>
  *   <li><b>Unpublished PENDING rows.</b> A PENDING row with {@code published_at} null
  *       has no message known to be on the broker: its publish on create failed or was
  *       never confirmed, or step 1 just reclaimed it. Each is republished, and
  *       {@code published_at} is set only once the broker confirms it — an unconfirmed
- *       republish leaves the row for the next sweep.</li>
+ *       republish leaves the row for the next sweep. Runs after step 2, so a reclaimed
+ *       row that was already on its last attempt is marked DEAD, not retried again.</li>
  * </ol>
  *
  * <p>Both steps can deliver a notification twice. A reclaimed row may have been
@@ -45,31 +53,39 @@ public class LeaseReconciler {
     private final NotificationMetrics metrics;
     private final TransactionTemplate transactionTemplate;
     private final ReconcilerProperties properties;
+    /** The listener's retry limit: a row with this many attempts gets no more. */
+    private final int maxAttempts;
 
     public LeaseReconciler(NotificationRepository repository,
                            NotificationPublisher publisher,
                            NotificationMetrics metrics,
                            TransactionTemplate transactionTemplate,
-                           ReconcilerProperties properties) {
+                           ReconcilerProperties properties,
+                           RabbitProperties rabbitProperties) {
         this.repository = repository;
         this.publisher = publisher;
         this.metrics = metrics;
         this.transactionTemplate = transactionTemplate;
         this.properties = properties;
+        this.maxAttempts = rabbitProperties.getListener().getSimple().getRetry().getMaxAttempts();
     }
 
     /**
      * One sweep. Fixed delay, so a slow sweep never overlaps the next one on this
      * instance; across instances, {@code SKIP LOCKED} keeps them off each other's rows.
-     * The republish pass runs even if reclaiming failed, and an exception is logged by
-     * the scheduler and the next sweep runs as usual.
+     * Each pass runs even if an earlier one failed, and an exception is logged by the
+     * scheduler and the next sweep runs as usual.
      */
     @Scheduled(fixedDelayString = "${notifications.reconciler.sweep-interval:PT30S}")
     public void scheduledSweep() {
         try {
             reclaimExpiredLeases();
         } finally {
-            republishUnpublished();
+            try {
+                markExhaustedDead();
+            } finally {
+                republishUnpublished();
+            }
         }
     }
 
@@ -90,6 +106,33 @@ public class LeaseReconciler {
         log.warn("Reclaimed {} notification(s) stranded in SENDING past the {} lease: {}",
                 reclaimed.size(), properties.leaseTimeout(), reclaimed);
         return reclaimed.size();
+    }
+
+    /**
+     * Marks DEAD up to one batch of PENDING rows that used up their retries but were
+     * never recorded DEAD; returns how many. Each is counted in {@code notifications.dead}
+     * like any other DEAD, and in {@code notifications.dead_reconciled}. The update is
+     * guarded on PENDING, so if the dead-letter handler records a row first, this skips it.
+     */
+    public int markExhaustedDead() {
+        List<UUID> dead = transactionTemplate.execute(tx -> {
+            List<UUID> exhausted = repository.lockExhaustedPending(
+                    maxAttempts, properties.deadGrace().toMillis(), properties.batchSize());
+            if (!exhausted.isEmpty()) {
+                repository.markExhaustedDead(exhausted,
+                        "Delivery retries exhausted; marked DEAD by the reconciler "
+                                + "because the dead-letter handler could not record it");
+            }
+            return exhausted;
+        });
+        if (dead == null || dead.isEmpty()) {
+            return 0;
+        }
+        repository.findAllById(dead).forEach(n -> metrics.dead(metrics.tenantName(n.getTenantId())));
+        metrics.deadReconciled(dead.size());
+        log.warn("Marked {} notification(s) DEAD that had used up their {} attempts but were never recorded DEAD: {}",
+                dead.size(), maxAttempts, dead);
+        return dead.size();
     }
 
     /**
