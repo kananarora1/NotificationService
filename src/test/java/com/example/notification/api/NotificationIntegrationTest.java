@@ -6,10 +6,14 @@ import com.example.notification.domain.Channel;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 import com.example.notification.messaging.NotificationPublisher;
+import com.example.notification.messaging.ParkingLot;
+import com.example.notification.messaging.QueueArgumentsCheck;
 import com.example.notification.messaging.RabbitConfig;
+import com.example.notification.metrics.MetricsPoller;
 import com.example.notification.provider.NotificationProvider;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.ratelimit.RateLimiter;
+import com.example.notification.reconciler.LeaseReconciler;
 import com.example.notification.repository.NotificationRepository;
 import com.example.notification.service.DataIntegrityViolations;
 import com.example.notification.service.NotificationService;
@@ -28,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.AmqpConnectException;
 import org.springframework.amqp.core.AmqpAdmin;
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.core.QueueBuilder;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.amqp.rabbit.listener.AbstractMessageListenerContainer;
@@ -42,6 +48,7 @@ import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -53,6 +60,7 @@ import org.springframework.http.MediaType;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultMatcher;
@@ -90,7 +98,9 @@ import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mockingDetails;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -103,6 +113,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 @AutoConfigureObservability // enable the real (Prometheus) meter registry in tests, not just SimpleMeterRegistry
 @Testcontainers
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class NotificationIntegrationTest {
 
     // Seeded tenants (see TenantSeeder): acme/60, globex/10, initech/5 per minute.
@@ -253,6 +264,15 @@ class NotificationIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private LeaseReconciler reconciler;
+
+    @Autowired
+    private MetricsPoller metricsPoller;
+
+    @Autowired
+    private ParkingLot parkingLot;
 
     @BeforeEach
     void resetRateLimiterState() {
@@ -532,6 +552,7 @@ class NotificationIntegrationTest {
     @Test
     void processingIdempotencySkipsAlreadySentOnRedelivery() {
         Notification n = new Notification("proc@example.com", Channel.EMAIL, "once");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
 
@@ -550,6 +571,7 @@ class NotificationIntegrationTest {
         // processingIdempotencySkipsAlreadySentOnRedelivery) does not cover this: both
         // threads read PENDING before either writes.
         Notification n = new Notification("race-send@example.com", Channel.EMAIL, "once");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
 
@@ -845,6 +867,7 @@ class NotificationIntegrationTest {
     void strandedSendingClaimIsRecoveredAndDelivered() {
         double reclaimedBefore = counter("notifications.reclaimed");
         Notification n = new Notification("strand@example.com", Channel.EMAIL, "recover me");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
 
@@ -867,6 +890,7 @@ class NotificationIntegrationTest {
     @Test
     void staleLeaseHolderCannotOverwriteOrReleaseAfterReclaim() {
         Notification n = new Notification("lease@example.com", Channel.EMAIL, "guarded");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
         UUID tokenA = UUID.randomUUID();
@@ -897,6 +921,7 @@ class NotificationIntegrationTest {
     @Test
     void workerWhoseLeaseWasReclaimedDropsItsLateResultWithoutOverwriting() throws Exception {
         Notification n = new Notification("slow-ack@example.com", Channel.EMAIL, "outlives its lease");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
         CountDownLatch release = new CountDownLatch(1);
@@ -964,6 +989,7 @@ class NotificationIntegrationTest {
     @Test
     void lateDeadLetterDoesNotOverwriteASentNotification() {
         Notification n = new Notification("late-dlq@example.com", Channel.EMAIL, "already sent");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
         service.attemptDelivery(id);
@@ -1021,6 +1047,7 @@ class NotificationIntegrationTest {
     @Test
     void republishingAnIdThatIsAlreadyQueuedDeliversItOnce() {
         Notification n = new Notification("requeued@example.com", Channel.EMAIL, "already queued");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         UUID id = n.getId();
         double republishedBefore = counter("notifications.republished");
@@ -1064,6 +1091,7 @@ class NotificationIntegrationTest {
                 Arrays.stream(NotificationStatus.values()).map(Enum::name).toArray(String[]::new));
 
         Notification n = new Notification("check@example.com", Channel.EMAIL, "constraint");
+        n.setTenantId(tenantId(ACME_KEY));
         repository.save(n);
         try {
             assertThatThrownBy(() -> jdbcTemplate.update(
@@ -1073,6 +1101,23 @@ class NotificationIntegrationTest {
         } finally {
             repository.deleteById(n.getId()); // never published; keep it away from the reconciler
         }
+    }
+
+    @Test
+    void everyNotificationMustBelongToAnExistingTenant() {
+        String nullable = jdbcTemplate.queryForObject("""
+                select is_nullable
+                  from information_schema.columns
+                 where table_schema = 'public' and table_name = 'notifications' and column_name = 'tenant_id'
+                """, String.class);
+        String foreignKey = jdbcTemplate.queryForObject("""
+                select pg_get_constraintdef(oid)
+                  from pg_constraint
+                 where conname = 'fk_notifications_tenant'
+                """, String.class);
+
+        assertThat(nullable).isEqualTo("NO");
+        assertThat(foreignKey).contains("FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT");
     }
 
     // ---- v12: error responses ----
@@ -1179,6 +1224,7 @@ class NotificationIntegrationTest {
         assertThat(DataIntegrityViolations.isViolationOf(race, "uk_notifications_tenant_idempotency_key")).isTrue();
 
         Notification tooLong = new Notification("long@example.com", Channel.EMAIL, "x".repeat(300));
+        tooLong.setTenantId(tenantId(ACME_KEY));
         tooLong.setIdempotencyKey("long-" + UUID.randomUUID());
         DataIntegrityViolationException notARace = catchThrowableOfType(
                 () -> repository.saveAndFlush(tooLong), DataIntegrityViolationException.class);
@@ -1237,6 +1283,189 @@ class NotificationIntegrationTest {
                         .contentType(MediaType.TEXT_PLAIN).content("hello"))
                 .andExpect(status().isUnsupportedMediaType())
                 .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON));
+    }
+
+    // ---- v13: a dead-letter whose DEAD write fails is never lost (audit B3) ----
+
+    @Test
+    void deadLetterWhoseDeadWriteKeepsFailingIsParkedThenHealedToDead() throws Exception {
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+        // globex: other tests dead-letter acme notifications, which could land in this window.
+        double deadBefore = counter("notifications.dead", "tenant", "globex");
+        double reconciledBefore = counter("notifications.dead_reconciled");
+
+        // Postgres is down by the time this notification exhausts its retries, so every
+        // attempt to record it as DEAD fails - the correlated outage that floods the DLQ.
+        Set<UUID> deadWriteFails = ConcurrentHashMap.newKeySet();
+        doAnswer(invocation -> {
+            if (deadWriteFails.contains(invocation.<UUID>getArgument(0))) {
+                throw new DataAccessResourceFailureException("Postgres unavailable (test)");
+            }
+            return invocation.callRealMethod();
+        }).when(service).markDead(any(), anyString());
+        UUID id = idFrom(mockMvc.perform(notifyPost("fail@example.com", GLOBEX_KEY))
+                .andExpect(status().isAccepted()).andReturn());
+        deadWriteFails.add(id);
+
+        // The DLQ handler gives up, and the message must land in the parking lot rather
+        // than be discarded. The description records what actually happened if it is not.
+        await().atMost(Duration.ofSeconds(45)).untilAsserted(() ->
+                assertThat(queueDepth(RabbitConfig.PARKING_LOT_QUEUE))
+                        .as("parking-lot depth (-1 = no such queue); observed: %s", deadLetterState(id, deadBefore))
+                        .isEqualTo(1));
+
+        Notification stranded = repository.findById(id).orElseThrow();
+        assertThat(stranded.getStatus()).as("DEAD could not be written").isEqualTo(NotificationStatus.PENDING);
+        assertThat(stranded.getAttempts()).isEqualTo(4);
+        assertThat(markDeadCalls(id)).as("DLQ handler attempts before parking").isEqualTo(3);
+        assertThat(queueDepth(RabbitConfig.DEAD_LETTER_QUEUE)).isZero();
+        assertThat(counter("notifications.dead", "tenant", "globex")).isEqualTo(deadBefore);
+
+        // Postgres is back. The reconciler finds the row past its retry budget and past
+        // the grace after its last attempt, and records it as DEAD itself.
+        deadWriteFails.remove(id);
+        jdbcTemplate.update(
+                "update notifications set last_attempt_at = now() - interval '10 minutes' where id = ?", id);
+        // The counters follow the commit, so they are awaited too, not read as soon as DEAD shows.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.DEAD);
+            assertThat(counter("notifications.dead", "tenant", "globex")).isEqualTo(deadBefore + 1);
+            assertThat(counter("notifications.dead_reconciled")).isEqualTo(reconciledBefore + 1);
+        });
+        assertThat(repository.findById(id).orElseThrow().getFailureReason()).contains("reconciler");
+        // The parked message stays for a human to inspect; nothing drains it automatically.
+        assertThat(queueDepth(RabbitConfig.PARKING_LOT_QUEUE)).isEqualTo(1);
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+    }
+
+    @Test
+    void deadLetterHandlerThatCannotRecordDeadParksTheMessageAndTheGaugeShowsIt() throws Exception {
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+        Notification n = exhaustedRow("parked@example.com");
+        UUID id = n.getId();
+        doAnswer(invocation -> {
+            if (id.equals(invocation.getArgument(0))) {
+                throw new DataAccessResourceFailureException("Postgres unavailable (test)");
+            }
+            return invocation.callRealMethod();
+        }).when(service).markDead(any(), anyString());
+
+        // Straight onto the DLQ, as the work queue's dead-lettering puts it there.
+        rabbitTemplate.convertAndSend(RabbitConfig.DEAD_LETTER_EXCHANGE, RabbitConfig.DEAD_LETTER_ROUTING_KEY,
+                id.toString());
+
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(queueDepth(RabbitConfig.PARKING_LOT_QUEUE)).isEqualTo(1));
+        assertThat(markDeadCalls(id)).as("the DLQ factory's short retry, not the work queue's 4").isEqualTo(3);
+        assertThat(queueDepth(RabbitConfig.DEAD_LETTER_QUEUE)).isZero();
+
+        // What the ParkedDeadLetters alert reads: queue_depth{queue="notifications.parking-lot"} > 0.
+        metricsPoller.pollQueues();
+        assertThat(meterRegistry.find("queue.depth").tags("queue", RabbitConfig.PARKING_LOT_QUEUE).gauge().value())
+                .isEqualTo(1.0);
+        String scrape = mockMvc.perform(get("/actuator/prometheus"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertThat(scrape).containsPattern("queue_depth\\{[^}]*queue=\"notifications\\.parking-lot\"[^}]*} 1\\.0");
+
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+        repository.deleteById(id);
+    }
+
+    @Test
+    void deadLetterForAMissingRowIsAcknowledgedNotParked() {
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+        UUID missing = UUID.randomUUID();
+
+        rabbitTemplate.convertAndSend(RabbitConfig.DEAD_LETTER_EXCHANGE, RabbitConfig.DEAD_LETTER_ROUTING_KEY,
+                missing.toString());
+
+        // Nothing to record, so nothing for a person to look at either.
+        await().atMost(Duration.ofSeconds(5)).until(() -> markDeadCalls(missing) == 1);
+        await().during(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(4)).until(() ->
+                queueDepth(RabbitConfig.PARKING_LOT_QUEUE) == 0 && queueDepth(RabbitConfig.DEAD_LETTER_QUEUE) == 0);
+        assertThat(markDeadCalls(missing)).as("not retried").isEqualTo(1);
+    }
+
+    @Test
+    void neitherDeadWriteOverwritesASentOrInFlightRow() {
+        double reconciledBefore = counter("notifications.dead_reconciled");
+        Notification sent = exhaustedRow("exhausted-sent@example.com");
+        Notification sending = exhaustedRow("exhausted-sending@example.com");
+        Notification recent = exhaustedRow("exhausted-recent@example.com");
+        Notification stranded = exhaustedRow("exhausted-stranded@example.com");
+        jdbcTemplate.update("update notifications set status = 'SENT', sent_at = now() where id = ?", sent.getId());
+        jdbcTemplate.update("update notifications set status = 'SENDING', claim_token = ?, claimed_at = now() where id = ?",
+                UUID.randomUUID(), sending.getId());
+        for (Notification old : List.of(sent, sending, stranded)) {
+            jdbcTemplate.update(
+                    "update notifications set last_attempt_at = now() - interval '10 minutes' where id = ?", old.getId());
+        }
+
+        // A late dead-letter for each of the first two: the listener's guarded write.
+        service.markDead(sent.getId(), "late dead-letter");
+        service.markDead(sending.getId(), "late dead-letter");
+        // The reconciler's: only the row that is PENDING and past the dead grace qualifies.
+        await().atMost(Duration.ofSeconds(5)).until(() ->
+                repository.findById(stranded.getId()).orElseThrow().getStatus() == NotificationStatus.DEAD
+                        && counter("notifications.dead_reconciled") == reconciledBefore + 1);
+        reconciler.markExhaustedDead();
+
+        assertThat(repository.findById(sent.getId()).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENT);
+        assertThat(repository.findById(sent.getId()).orElseThrow().getFailureReason()).isNull();
+        assertThat(repository.findById(sending.getId()).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENDING);
+        assertThat(repository.findById(recent.getId()).orElseThrow().getStatus())
+                .as("its dead-letter may still be on the way").isEqualTo(NotificationStatus.PENDING);
+        assertThat(counter("notifications.dead_reconciled")).isEqualTo(reconciledBefore + 1);
+
+        repository.deleteAllById(List.of(sent.getId(), sending.getId(), recent.getId(), stranded.getId()));
+    }
+
+    @Test
+    void replayingAParkedMessageSendsItsNotificationThroughDeliveryAgain() {
+        purgeIfPresent(RabbitConfig.PARKING_LOT_QUEUE);
+        Notification dead = exhaustedRow("replayed@example.com");
+        jdbcTemplate.update("update notifications set status = 'DEAD', failure_reason = 'parked' where id = ?",
+                dead.getId());
+        Notification sent = exhaustedRow("replayed-sent@example.com");
+        jdbcTemplate.update("update notifications set status = 'SENT', sent_at = now() where id = ?", sent.getId());
+        rabbitTemplate.convertAndSend("", RabbitConfig.PARKING_LOT_QUEUE, dead.getId().toString());
+        rabbitTemplate.convertAndSend("", RabbitConfig.PARKING_LOT_QUEUE, sent.getId().toString());
+        await().atMost(Duration.ofSeconds(5)).until(() -> queueDepth(RabbitConfig.PARKING_LOT_QUEUE) == 2);
+
+        assertThat(parkingLot.replayOne()).contains(new ParkingLot.Replayed(dead.getId(), true));
+        assertThat(parkingLot.replayOne()).as("already delivered: acked, not resent")
+                .contains(new ParkingLot.Replayed(sent.getId(), false));
+        assertThat(parkingLot.replayOne()).isEmpty();
+        assertThat(queueDepth(RabbitConfig.PARKING_LOT_QUEUE)).isZero();
+
+        // A fresh start: a new retry budget, so the reconciler leaves it alone, and delivered once.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+            Notification row = repository.findById(dead.getId()).orElseThrow();
+            assertThat(row.getStatus()).isEqualTo(NotificationStatus.SENT);
+            assertThat(row.getAttempts()).isEqualTo(1);
+            assertThat(row.getFailureReason()).isNull();
+        });
+        assertThat(provider.invocationTimes(sent.getId())).isEmpty();
+    }
+
+    @Test
+    void startupRefusesAQueueLeftByAnEarlierVersionWithDifferentArguments() {
+        // As a pre-v13 notifications.dlq: same name, no dead-letter arguments.
+        String name = "args-check-" + UUID.randomUUID();
+        amqpAdmin.declareQueue(QueueBuilder.nonDurable(name).build());
+        Queue withParkingLot = QueueBuilder.nonDurable(name)
+                .withArgument("x-dead-letter-exchange", RabbitConfig.DEAD_LETTER_EXCHANGE)
+                .withArgument("x-dead-letter-routing-key", RabbitConfig.PARKING_LOT_ROUTING_KEY)
+                .build();
+        try {
+            assertThatThrownBy(() -> new QueueArgumentsCheck(amqpAdmin, List.of(withParkingLot)).run(null))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("rabbitmqctl delete_queue " + name);
+            // The same declaration as the broker's passes.
+            new QueueArgumentsCheck(amqpAdmin, List.of(QueueBuilder.nonDurable(name).build())).run(null);
+        } finally {
+            amqpAdmin.deleteQueue(name);
+        }
     }
 
     // ---- helpers ----
@@ -1322,6 +1551,44 @@ class NotificationIntegrationTest {
     /** Resolves a tenant the way the auth path does: by the hash, never the plaintext. */
     private Tenant tenantByKey(String apiKey) {
         return tenantRepository.findByApiKeyHash(ApiKeyHasher.sha256Hex(apiKey)).orElseThrow();
+    }
+
+    /** A PENDING row that has used up the work queue's 4 attempts, as the last failed one leaves it. */
+    private Notification exhaustedRow(String recipient) {
+        Notification n = new Notification(recipient, Channel.EMAIL, "exhausted");
+        n.setTenantId(tenantId(ACME_KEY));
+        repository.save(n);
+        jdbcTemplate.update(
+                "update notifications set attempts = 4, last_attempt_at = now(), published_at = now() where id = ?",
+                n.getId());
+        return n;
+    }
+
+    /** Ready messages in a queue, or -1 if the broker has no such queue. */
+    private long queueDepth(String queue) {
+        var info = amqpAdmin.getQueueInfo(queue);
+        return info == null ? -1 : info.getMessageCount();
+    }
+
+    private void purgeIfPresent(String queue) {
+        if (amqpAdmin.getQueueInfo(queue) != null) {
+            amqpAdmin.purgeQueue(queue, false);
+        }
+    }
+
+    /** How many times the dead-letter handler tried to record this id as DEAD. */
+    private long markDeadCalls(UUID id) {
+        return mockingDetails(service).getInvocations().stream()
+                .filter(i -> i.getMethod().getName().equals("markDead") && id.equals(i.getArgument(0)))
+                .count();
+    }
+
+    private String deadLetterState(UUID id, double deadBefore) {
+        Notification row = repository.findById(id).orElseThrow();
+        return "markDead calls=%d, row %s attempts=%d, notifications.dead +%.0f, dlq depth=%d"
+                .formatted(markDeadCalls(id), row.getStatus(), row.getAttempts(),
+                        counter("notifications.dead", "tenant", "globex") - deadBefore,
+                        queueDepth(RabbitConfig.DEAD_LETTER_QUEUE));
     }
 
     private double counter(String name, String... tags) {

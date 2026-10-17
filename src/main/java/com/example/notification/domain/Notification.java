@@ -54,7 +54,7 @@ public class Notification {
     private String idempotencyKey;
 
     /** The tenant (resolved from the API key) that created this notification. */
-    @Column(name = "tenant_id")
+    @Column(name = "tenant_id", nullable = false)
     private UUID tenantId;
 
     @Enumerated(EnumType.STRING)
