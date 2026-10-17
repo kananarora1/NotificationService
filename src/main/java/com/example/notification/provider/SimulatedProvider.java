@@ -35,7 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * across a crash.
  */
 @Component
-@Profile("!prod")
+@Profile("!prod & !brevo")
 public class SimulatedProvider implements NotificationProvider {
 
     private static final Logger log = LoggerFactory.getLogger(SimulatedProvider.class);

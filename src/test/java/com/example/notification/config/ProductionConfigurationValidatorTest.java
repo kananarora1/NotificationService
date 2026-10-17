@@ -49,6 +49,8 @@ class ProductionConfigurationValidatorTest {
                 .withProperty("RABBITMQ_HOST", "rabbitmq.internal")
                 .withProperty("RABBITMQ_USERNAME", "notification_service")
                 .withProperty("RABBITMQ_PASSWORD", "a-real-secret")
-                .withProperty("MANAGEMENT_API_TOKEN", "operator-secret");
+                .withProperty("MANAGEMENT_API_TOKEN", "operator-secret")
+                .withProperty("BREVO_API_KEY", "brevo-api-key")
+                .withProperty("BREVO_SENDER_EMAIL", "notifications@relaynest.tech");
     }
 }

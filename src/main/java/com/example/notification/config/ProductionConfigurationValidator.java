@@ -27,7 +27,9 @@ public class ProductionConfigurationValidator {
             "RABBITMQ_HOST",
             "RABBITMQ_USERNAME",
             "RABBITMQ_PASSWORD",
-            "MANAGEMENT_API_TOKEN"
+            "MANAGEMENT_API_TOKEN",
+            "BREVO_API_KEY",
+            "BREVO_SENDER_EMAIL"
     );
 
     private final Environment environment;

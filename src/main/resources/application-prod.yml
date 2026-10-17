@@ -18,6 +18,13 @@ spring:
     password: ${RABBITMQ_PASSWORD}
 
 notifications:
+  brevo:
+    api-url: ${BREVO_API_URL:https://api.brevo.com/v3/smtp/email}
+    api-key: ${BREVO_API_KEY}
+    sender-email: ${BREVO_SENDER_EMAIL}
+    sender-name: ${BREVO_SENDER_NAME:RelayNest Notifications}
+    reply-to-email: ${BREVO_REPLY_TO_EMAIL:}
+    subject: ${BREVO_EMAIL_SUBJECT:RelayNest notification}
   seeding:
     # Production tenants are provisioned deliberately; never create the
     # documented development tenants from application.yml.
