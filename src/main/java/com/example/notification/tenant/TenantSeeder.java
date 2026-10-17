@@ -10,8 +10,9 @@ import org.springframework.stereotype.Component;
 /**
  * Seeds the configured tenants on startup (see {@link TenantSeedProperties}). Seeding is
  * idempotent (keyed on the unique api key hash) so it is safe to run repeatedly and
- * across multiple app instances sharing the same Postgres — a concurrent double-insert
- * simply hits the UNIQUE constraint and is ignored.
+ * across multiple app instances sharing the same Postgres. A concurrent double-insert
+ * is ignored only after confirming that the same API-key hash now exists; other
+ * constraint failures are allowed to stop startup rather than being hidden.
  *
  * <p>Only the SHA-256 hash of each key is written; the plaintext lives in configuration
  * and never reaches the database.
@@ -38,7 +39,8 @@ public class TenantSeeder implements ApplicationRunner {
 
         for (TenantSeedProperties.SeedTenant seed : properties.tenants()) {
             // Existence is checked by hash — the same lookup the auth path uses.
-            if (tenants.findByApiKeyHash(ApiKeyHasher.sha256Hex(seed.apiKey())).isPresent()) {
+            String apiKeyHash = ApiKeyHasher.sha256Hex(seed.apiKey());
+            if (tenants.findByApiKeyHash(apiKeyHash).isPresent()) {
                 continue;
             }
             try {
@@ -46,7 +48,12 @@ public class TenantSeeder implements ApplicationRunner {
                 // The key itself is never logged.
                 log.info("Seeded tenant '{}' (limit {}/min)", seed.name(), seed.rateLimitPerMinute());
             } catch (DataIntegrityViolationException e) {
-                // Another instance seeded this tenant concurrently — fine.
+                // A unique-key race is benign only if another instance inserted the
+                // same credential. A name collision or any other DB constraint error
+                // must remain visible instead of silently producing partial setup.
+                if (tenants.findByApiKeyHash(apiKeyHash).isEmpty()) {
+                    throw e;
+                }
                 log.debug("Tenant '{}' already seeded by another instance", seed.name());
             }
         }

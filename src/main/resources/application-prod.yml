@@ -1,0 +1,31 @@
+# Production deliberately has no infrastructure or credential fallbacks.  The
+# development defaults in application.yml are convenient for docker-compose,
+# but must never become a live deployment by accident.
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+  rabbitmq:
+    host: ${RABBITMQ_HOST}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+
+notifications:
+  seeding:
+    # Production tenants are provisioned deliberately; never create the
+    # documented development tenants from application.yml.
+    enabled: false
+
+management:
+  security:
+    # Metrics identify tenant activity and operational capacity, so they are an
+    # operator surface, not a tenant API. Supply this separately from tenant keys.
+    enabled: true
+    token: ${MANAGEMENT_API_TOKEN}
