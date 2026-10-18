@@ -160,6 +160,8 @@ management:
         include: health, metrics, prometheus
   endpoint:
     health:
+      probes:
+        enabled: true
       show-details: when-authorized
   metrics:
     tags:

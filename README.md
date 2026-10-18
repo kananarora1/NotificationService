@@ -20,6 +20,220 @@ plus the auto-provided HTTP/JVM/DB/Rabbit metrics) on a Prometheus endpoint, and
 stack ships an auto-provisioned **Prometheus + Grafana** with a ready-made dashboard.
 See [Observability](#observability-v8).
 
+## DevOps project: local Kubernetes
+
+Baseline: [`d40f9bf9d73c0287399baddf2cb7ea15be825870`](https://github.com/kananarora1/NotificationService/commit/d40f9bf9d73c0287399baddf2cb7ea15be825870),
+also tagged `devops-baseline-2026-10-18`. Improvements live on `devops/final-project`
+and belong in one PR. The webhook experiment is excluded.
+
+This demo runs one application replica and one Prometheus collector in kind.
+PostgreSQL, RabbitMQ and Redis remain in the existing Docker Compose stack.
+The application calls these through Docker Desktop's `host.docker.internal`.
+The provider is simulated: a `SENT` result demonstrates processing, not an email
+arriving in an inbox. No Brevo credentials are needed for this demo.
+
+### Prerequisites and startup
+
+Use Docker Desktop, Docker CLI with `image save --platform` support, kind, kubectl,
+Bash, curl, jq and uuidgen. The verified environment is macOS/Apple Silicon.
+Java 21 is needed for host-run tests; the Docker build supplies its own Java 21.
+Keep Docker Desktop running. Run commands from the repository root.
+
+1. Copy `.env.example` to `.env` if it does not exist, then set local database and
+   RabbitMQ credentials. Keep the demo database name `notifications`, Postgres port
+   `5433`, RabbitMQ port `5672`, and Redis port `6379`, or adjust `k8s/configmap.yaml`.
+   `.env` is ignored by Git and excluded from Docker builds. Never paste credentials
+   into the PR or evidence.
+2. Start dependencies and create the cluster once:
+
+   ```bash
+   docker compose up -d postgres rabbitmq redis
+   kind create cluster --name relaynest --config k8s/kind-config.yaml
+   kubectl --context kind-relaynest apply -f k8s/namespace.yaml
+   ```
+
+3. Create the local Secret using the same credentials as Compose:
+
+   ```bash
+   set -a
+   source .env
+   set +a
+   printf 'DB_USERNAME=%s\nDB_PASSWORD=%s\nRABBITMQ_USERNAME=%s\nRABBITMQ_PASSWORD=%s\n' \
+     "$DB_USERNAME" "$DB_PASSWORD" "$RABBITMQ_USERNAME" "$RABBITMQ_PASSWORD" |
+     kubectl --context kind-relaynest -n notification-service create secret generic \
+       notification-service-secrets --from-env-file=/dev/stdin --dry-run=client -o yaml |
+     kubectl --context kind-relaynest apply -f -
+   ```
+
+   ConfigMaps hold addresses and non-secret options. Kubernetes Secrets hold
+   credentials, but base64 encoding is not encryption; cluster access still matters.
+   Credentials enter the application through environment variables. Changing a
+   Secret or ConfigMap requires an application rollout to refresh those variables.
+
+4. Load the CI image and apply the manifests:
+
+   ```bash
+   IMAGE=ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339@sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8
+   bash scripts/load-kind-image.sh "$IMAGE"
+   kubectl --context kind-relaynest apply -k k8s
+   kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
+   kubectl --context kind-relaynest -n notification-service rollout status deployment/prometheus --timeout=180s
+   ```
+
+   For a private GHCR package, first authenticate with `docker login ghcr.io`
+   using a credential permitted to read it. Do not print or commit the credential.
+   The loader exports only the node's CPU architecture, avoiding kind's failure to
+   import missing variants from a multi-platform Docker image. Images are preloaded
+   into kind; no registry credentials are mounted into application pods.
+   Flyway initializes a fresh database automatically. Do not reset an existing
+   database just to silence a migration warning; check its history first.
+
+5. Open two terminals for localhost-only access:
+
+   ```bash
+   kubectl --context kind-relaynest -n notification-service port-forward --address 127.0.0.1 svc/notification-service 18080:80
+   ```
+
+   ```bash
+   kubectl --context kind-relaynest -n notification-service port-forward --address 127.0.0.1 svc/prometheus 19090:9090
+   ```
+
+   The application is at `http://127.0.0.1:18080`; Prometheus is at
+   `http://127.0.0.1:19090`. Stop each port forward with Ctrl-C. Both Services are
+   ClusterIP; there is no public Ingress or LoadBalancer.
+
+### Delivery, version evidence and rollback
+
+GitHub Actions tests with Java 21 on pull requests targeting `main` and on pushes.
+A separate trusted push workflow builds and publishes AMD64 and ARM64 images to
+GHCR only for pushes to `main` or `devops/final-project`; pull-request workflows
+have no package write permission. Publishing uses the job-scoped `GITHUB_TOKEN` and
+`packages: write`; application/provider secrets are not supplied to CI.
+Actions are pinned to commit hashes, jobs have time limits, and test reports are
+retained as workflow artifacts for 14 days.
+
+The release boundary is manual: choose a successful run, load its full-SHA image,
+update the image and both version labels in `k8s/deployment.yaml`, commit, and apply.
+The image source commit and the later configuration commit can differ. Record both
+in the PR; do not imply that updating a manifest changes an already-built image.
+A SHA tag is traceable but registry tags can technically be overwritten. Record
+the registry digest as the immutable artifact identity too:
+
+```bash
+git rev-parse HEAD
+docker buildx imagetools inspect "$IMAGE"
+docker image inspect "$IMAGE" --format '{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+kubectl --context kind-relaynest -n notification-service get deployment notification-service -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl --context kind-relaynest -n notification-service get pods -o wide
+```
+
+The verified image source is `e5727d646fb18f3fa88044de8f5e4097aff7b339`:
+[passing CI run](https://github.com/kananarora1/NotificationService/actions/runs/39138439008).
+Its registry index digest is
+`sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8`;
+the ARM64 manifest is
+`sha256:0a34872042524e48043c8bcc8a6ca254396e1f29d5bdab78bb0fc7c50981464b`.
+A single-platform kind import can report a different local index/imageID; retain
+the platform manifest and revision label when comparing the imported artifact.
+
+Rollback was demonstrated to revision 2, followed by restoration of the intended
+release. For a new demonstration, inspect history and choose the prior revision:
+
+```bash
+kubectl --context kind-relaynest -n notification-service rollout history deployment/notification-service
+kubectl --context kind-relaynest -n notification-service rollout undo deployment/notification-service --to-revision=<previous-revision>
+kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
+kubectl --context kind-relaynest apply -k k8s
+kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
+```
+
+`rollout undo` restores the pod template, not the database or ConfigMap/Secret
+contents, and does not update kubectl's last-applied annotation. The repeatable
+release rollback is to reapply a reviewed earlier manifest from Git and verify
+health and a request. Ensure the previous image is still available. Database
+migrations must remain backward compatible; an image rollback cannot undo schema
+changes. Keep the repository's intended manifest consistent with the chosen release.
+
+### Verification and observability
+
+With the application port forward running:
+
+```bash
+bash scripts/verify-k8s.sh --simulated
+```
+
+The script checks health/liveness/readiness and unauthenticated access, then submits
+three unique test requests. It asserts `SENT` in one attempt, transient recovery to
+`SENT` in three attempts, and permanent failure to `DEAD` in four attempts. It checks
+counter deltas (3 submitted, 2 sent, 6 failed attempts, 1 dead), prints latency/HTTP
+metrics, and finds the corresponding notification IDs in pod logs. It exits nonzero
+on failure. It assumes the local simulator, one app replica, seeded development
+tenant `key-acme`, and no restart during measurement. Do not run it against Brevo.
+Override `BASE_URL`, `API_KEY`, `KUBE_CONTEXT`, or `MANAGEMENT_API_TOKEN` if needed.
+
+Prometheus scrapes `notification-service:80/actuator/prometheus` every five seconds.
+Verify collection, not just endpoint availability:
+
+```bash
+curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=up{job="notification-service"}' | jq .data.result
+curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=notifications_sent_total' | jq .data.result
+```
+
+Useful queries include `notifications_dead_total`, `notifications_failed_attempt_total`,
+`rate(http_server_requests_seconds_count[5m])`, and
+`histogram_quantile(0.95, sum by (le) (rate(notifications_delivery_latency_seconds_bucket[5m])))`.
+Short demos may not have enough samples for a useful rate or percentile; show counts
+and timer sums as well. Prometheus stores at most 24 hours/256MB in an ephemeral
+volume; pod replacement loses history. This collector does not load the host
+Compose alert rules or Grafana dashboard. These remain a separate host-run setup.
+
+Startup/liveness test application availability. Readiness includes PostgreSQL
+because accepting a request needs a durable write. RabbitMQ can recover via
+republishing, Redis rate limiting fails open, and provider failures use retries;
+those failures should not restart healthy JVMs. Aggregate `/actuator/health` can
+still report DOWN for a degraded dependency. The pod gets 90 seconds to drain,
+matching the application's multiple shutdown phases.
+
+### Security review and demo limits
+
+Application pods run as UID 10001 with a read-only root filesystem, dropped
+capabilities, RuntimeDefault seccomp, no privilege escalation or mounted service
+account token, resource limits, and only `/tmp` writable. Prometheus has equivalent
+restrictions with its data directory writable. The application Secret is not in Git.
+The API requires a tenant key and tenant reads are scoped. Brevo logging excludes
+the API key and raw provider response body.
+
+This is a local demo, not a production security certification. Development tenant
+keys are public, metrics are unauthenticated within the cluster, and there is no
+NetworkPolicy. Existing Compose dependency ports bind to host interfaces; use a
+trusted local machine/network and restrict those ports before any public deployment.
+The simulator logs test recipient addresses; use synthetic data only. Logs have
+timestamps and notification IDs but are not JSON structured logs, and distributed
+tracing is not implemented. Dependency/image vulnerability scanning is still a
+follow-up; no claim of zero vulnerabilities is made. Single replicas and local
+volumes provide no high availability. Resource sizes are demo settings, not a
+capacity guarantee. Do not run the public development keys in production.
+
+### PR evidence and viva checklist
+
+In the PR description link the baseline, exact final configuration commit, successful
+CI run, image source SHA and registry digest. Attach actual verification output and
+Prometheus query evidence. Screenshots can supplement these; keep evidence outside
+the codebase and exclude credentials. Save fresh evidence after any application
+image change. Do not claim a real email was delivered by the simulator.
+
+Be ready to explain:
+
+- Why a replaceable Deployment suits the app while durable data lives in PostgreSQL.
+- How a request becomes a database row, queued ID, delivery attempt and final status.
+- How Java 21 tests gate image publishing, and why local deployment has a manual boundary.
+- How tags, image digests, revision labels and configuration commits relate.
+- Why startup/liveness differ from readiness and why rollback cannot undo migrations.
+- How notification IDs, failed-attempt counters, DEAD counts and latency identify failures.
+- Why secret encoding is not encryption and why local demo keys/exposure must change for production.
+- How more traffic affects database capacity, queue backlog, worker concurrency and rate limits;
+  the service already processes notifications asynchronously.
+
 ## Stack
 
 - Java 21, Spring Boot 3.3 (Spring Web, Spring Data JPA, Validation, AMQP, Data Redis, Actuator)
@@ -37,7 +251,7 @@ A `Notification` has: `id` (UUID), `tenantId` (the API-key tenant that created i
 a nullable `failureReason`, a nullable and **UNIQUE** `idempotencyKey`, `createdAt`,
 a nullable `sentAt`, a nullable `publishedAt` (when the broker confirmed its message),
 and the delivery lease `claimToken` / `claimedAt` (both set only
-while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKey`, and
+while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKeyHash`, and
 `rateLimitPerMinute`.
 
 `status` is one of:
@@ -46,7 +260,7 @@ while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKey`, and
 |-----------|---------------------------------------------------------------------|
 | `PENDING` | accepted, awaiting delivery — including between retries              |
 | `SENDING` | claimed by one consumer under a lease, provider call in flight       |
-| `SENT`    | delivered successfully                                               |
+| `SENT`    | provider call succeeded (simulated locally; Brevo acceptance is not inbox delivery) |
 | `DEAD`    | permanently failed: retries exhausted and the message dead-lettered  |
 
 Delivery is handled by `SimulatedProvider`: it sleeps ~800ms to mimic a slow
@@ -66,9 +280,9 @@ id it has already delivered is acknowledged without delivering again (logged as
 in the JVM, though, so unlike a real provider's it is forgotten on restart and not shared
 between instances: it demonstrates the contract within one process, not across a crash.
 
-`SimulatedProvider` is for development and tests only. It is inactive under the `prod`
-profile, so starting with `SPRING_PROFILES_ACTIVE=prod` fails until a real
-`NotificationProvider` bean exists — deliberately, rather than "delivering" into a log.
+`SimulatedProvider` is for development and tests only. The `prod` and `brevo`
+profiles select `BrevoEmailProvider`, which supports EMAIL and requires configured
+Brevo credentials. Delivery-confirmation webhooks are excluded from this DevOps branch.
 
 ## Architecture (v4)
 
