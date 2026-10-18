@@ -17,8 +17,11 @@ spec:
         app.kubernetes.io/name: notification-service
         app.kubernetes.io/version: e5727d646fb18f3fa88044de8f5e4097aff7b339
     spec:
+      terminationGracePeriodSeconds: 90
       automountServiceAccountToken: false
       securityContext:
+        seccompProfile:
+          type: RuntimeDefault
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
@@ -34,6 +37,9 @@ spec:
                 name: notification-service-config
             - secretRef:
                 name: notification-service-secrets
+          env:
+            - name: MANAGEMENT_ENDPOINT_HEALTH_GROUP_READINESS_INCLUDE
+              value: readinessState,db
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -51,7 +57,7 @@ spec:
               mountPath: /tmp
           startupProbe:
             httpGet:
-              path: /actuator/health
+              path: /actuator/health/liveness
               port: http
             failureThreshold: 30
             periodSeconds: 5
@@ -65,6 +71,7 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 3
       volumes:
         - name: temporary-files
           emptyDir: {}
