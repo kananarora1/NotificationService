@@ -73,7 +73,7 @@ Keep Docker Desktop running. Run commands from the repository root.
 4. Load the CI image and apply the manifests:
 
    ```bash
-   IMAGE=ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339
+   IMAGE=ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339@sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8
    bash scripts/load-kind-image.sh "$IMAGE"
    kubectl --context kind-relaynest apply -k k8s
    kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
@@ -104,9 +104,10 @@ Keep Docker Desktop running. Run commands from the repository root.
 
 ### Delivery, version evidence and rollback
 
-GitHub Actions tests with Java 21 before building. Pull requests targeting `main`
-test and build; pushes to `main` or `devops/final-project` also publish AMD64 and
-ARM64 images to GHCR. Publishing uses the job-scoped `GITHUB_TOKEN` and
+GitHub Actions tests with Java 21 on pull requests targeting `main` and on pushes.
+A separate trusted push workflow builds and publishes AMD64 and ARM64 images to
+GHCR only for pushes to `main` or `devops/final-project`; pull-request workflows
+have no package write permission. Publishing uses the job-scoped `GITHUB_TOKEN` and
 `packages: write`; application/provider secrets are not supplied to CI.
 Actions are pinned to commit hashes, jobs have time limits, and test reports are
 retained as workflow artifacts for 14 days.

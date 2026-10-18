@@ -27,7 +27,7 @@ spec:
         runAsGroup: 10001
       containers:
         - name: notification-service
-          image: ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339
+          image: ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339@sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
