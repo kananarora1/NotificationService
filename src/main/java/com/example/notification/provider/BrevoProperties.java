@@ -10,6 +10,8 @@ public record BrevoProperties(
         String senderEmail,
         String senderName,
         String replyToEmail,
-        String subject
+        String subject,
+        String webhookUsername,
+        String webhookPassword
 ) {
 }

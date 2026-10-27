@@ -51,6 +51,8 @@ class ProductionConfigurationValidatorTest {
                 .withProperty("RABBITMQ_PASSWORD", "a-real-secret")
                 .withProperty("MANAGEMENT_API_TOKEN", "operator-secret")
                 .withProperty("BREVO_API_KEY", "brevo-api-key")
-                .withProperty("BREVO_SENDER_EMAIL", "notifications@relaynest.tech");
+                .withProperty("BREVO_SENDER_EMAIL", "notifications@relaynest.tech")
+                .withProperty("BREVO_WEBHOOK_USERNAME", "relaynest")
+                .withProperty("BREVO_WEBHOOK_PASSWORD", "webhook-secret");
     }
 }

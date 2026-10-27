@@ -42,6 +42,8 @@ class BrevoEmailProviderTest {
 
         provider().send(notification);
 
+        assertThat(provider().requiresDeliveryConfirmation()).isTrue();
+
         assertThat(apiKey.get()).isEqualTo("test-api-key");
         assertThat(payload.get().at("/sender/email").asText()).isEqualTo("notifications@relaynest.tech");
         assertThat(payload.get().at("/sender/name").asText()).isEqualTo("RelayNest Notifications");
@@ -77,7 +79,9 @@ class BrevoEmailProviderTest {
                 "notifications@relaynest.tech",
                 "RelayNest Notifications",
                 "support@relaynest.tech",
-                "RelayNest notification");
+                "RelayNest notification",
+                "relaynest",
+                "webhook-secret");
         return new BrevoEmailProvider(properties, objectMapper, HttpClient.newHttpClient());
     }
 

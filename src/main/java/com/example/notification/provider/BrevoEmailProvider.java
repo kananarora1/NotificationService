@@ -46,6 +46,11 @@ public class BrevoEmailProvider implements NotificationProvider {
     }
 
     @Override
+    public boolean requiresDeliveryConfirmation() {
+        return true;
+    }
+
+    @Override
     public void send(Notification notification) {
         if (notification.getChannel() != Channel.EMAIL) {
             throw new IllegalArgumentException("BrevoEmailProvider only supports EMAIL notifications");

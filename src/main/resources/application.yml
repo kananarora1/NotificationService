@@ -102,6 +102,8 @@ notifications:
     sender-name: ${BREVO_SENDER_NAME:RelayNest Notifications}
     reply-to-email: ${BREVO_REPLY_TO_EMAIL:}
     subject: ${BREVO_EMAIL_SUBJECT:RelayNest notification}
+    webhook-username: ${BREVO_WEBHOOK_USERNAME:}
+    webhook-password: ${BREVO_WEBHOOK_PASSWORD:}
   listener:
     # How long the RabbitMQ listener containers may spend draining in-flight and
     # prefetched messages on shutdown. Keep below timeout-per-shutdown-phase (30s).

@@ -25,6 +25,8 @@ notifications:
     sender-name: ${BREVO_SENDER_NAME:RelayNest Notifications}
     reply-to-email: ${BREVO_REPLY_TO_EMAIL:}
     subject: ${BREVO_EMAIL_SUBJECT:RelayNest notification}
+    webhook-username: ${BREVO_WEBHOOK_USERNAME}
+    webhook-password: ${BREVO_WEBHOOK_PASSWORD}
   seeding:
     # Production tenants are provisioned deliberately; never create the
     # documented development tenants from application.yml.

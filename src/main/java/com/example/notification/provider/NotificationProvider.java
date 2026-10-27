@@ -5,8 +5,8 @@ import com.example.notification.domain.Notification;
 public interface NotificationProvider {
 
     /**
-     * Delivers the notification to its recipient. Implementations may block while
-     * talking to an external system and must throw if delivery fails.
+     * Sends the notification to a provider. Implementations may block while
+     * talking to an external system and must throw if the hand-off fails.
      *
      * <p><b>Contract: implementations MUST be idempotent on {@code notification.getId()}.</b>
      * Delivery is at-least-once. A consumer can die after this call has delivered but
@@ -25,4 +25,9 @@ public interface NotificationProvider {
      * having its lease reclaimed underneath it.
      */
     void send(Notification notification);
+
+    /** Whether a later provider callback must confirm delivery. */
+    default boolean requiresDeliveryConfirmation() {
+        return false;
+    }
 }
