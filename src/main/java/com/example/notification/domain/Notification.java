@@ -67,6 +67,22 @@ public class Notification {
     @Column
     private Instant sentAt;
 
+    /** Latest outcome reported by the delivery provider; distinct from the internal queue status. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "delivery_status")
+    private DeliveryStatus deliveryStatus;
+
+    /** Timestamp reported by the provider for the latest delivery event. */
+    @Column(name = "provider_event_at")
+    private Instant providerEventAt;
+
+    @Column(name = "provider_accepted_at")
+    private Instant providerAcceptedAt;
+
+    /** Timestamp of the provider's delivered event, not proof of inbox placement. */
+    @Column(name = "delivered_at")
+    private Instant deliveredAt;
+
     /** Number of delivery attempts made so far (incremented at the start of each attempt). */
     @Column(nullable = false)
     private int attempts;
@@ -76,14 +92,14 @@ public class Notification {
     private String failureReason;
 
     /**
-     * Identifies the consumer holding the SENDING lease; null in every other status.
+     * Identifies the consumer holding the SENDING lease; null while awaiting a webhook.
      * Read-only here: only the guarded UPDATEs in {@code NotificationRepository} write
      * it, so a stray {@code save()} can never resurrect or clobber a lease.
      */
     @Column(name = "claim_token", insertable = false, updatable = false)
     private UUID claimToken;
 
-    /** When the current SENDING lease began (database clock); null when not SENDING. */
+    /** When the current worker lease began; null while awaiting a webhook. */
     @Column(name = "claimed_at", insertable = false, updatable = false)
     private Instant claimedAt;
 
@@ -139,6 +155,22 @@ public class Notification {
 
     public Instant getSentAt() {
         return sentAt;
+    }
+
+    public DeliveryStatus getDeliveryStatus() {
+        return deliveryStatus;
+    }
+
+    public Instant getProviderEventAt() {
+        return providerEventAt;
+    }
+
+    public Instant getProviderAcceptedAt() {
+        return providerAcceptedAt;
+    }
+
+    public Instant getDeliveredAt() {
+        return deliveredAt;
     }
 
     public int getAttempts() {

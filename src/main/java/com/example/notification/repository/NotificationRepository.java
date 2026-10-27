@@ -40,7 +40,7 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     int claimForSending(@Param("id") UUID id, @Param("token") UUID token);
 
     /**
-     * Records a successful delivery (SENDING -> SENT), but only if the caller still holds
+     * Records a simulated delivery (SENDING -> SENT), but only if the caller still holds
      * the lease. Returns 0 if the lease was reclaimed in the meantime: the row now belongs
      * to whoever claimed it next, and this caller must not overwrite it.
      */
@@ -48,10 +48,86 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Modifying(clearAutomatically = true)
     @Query(value = """
             update notifications
-               set status = 'SENT', sent_at = :sentAt, claim_token = null, claimed_at = null
+               set status = 'SENT', sent_at = :sentAt, delivery_status = 'DELIVERED',
+                   delivered_at = :sentAt,
+                   claim_token = null, claimed_at = null
              where id = :id and status = 'SENDING' and claim_token = :token
             """, nativeQuery = true)
     int markSent(@Param("id") UUID id, @Param("token") UUID token, @Param("sentAt") Instant sentAt);
+
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set delivery_status = coalesce(delivery_status, 'ACCEPTED'),
+                   provider_accepted_at = now(), claim_token = null, claimed_at = null
+             where id = :id and status = 'SENDING' and claim_token = :token
+            """, nativeQuery = true)
+    int markProviderAccepted(@Param("id") UUID id, @Param("token") UUID token);
+
+    /**
+     * Inserts a provider callback exactly once. Brevo's event id is globally unique for that
+     * provider, so a replay or a webhook retry does not alter notification state twice.
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            insert into notification_delivery_events
+                (provider, provider_event_id, notification_id, event_type, occurred_at, reason)
+            values
+                ('BREVO', :eventId, :notificationId, :eventType, :occurredAt, :reason)
+            on conflict (provider, provider_event_id) do nothing
+            """, nativeQuery = true)
+    int recordBrevoEvent(@Param("eventId") long eventId,
+                         @Param("notificationId") UUID notificationId,
+                         @Param("eventType") String eventType,
+                         @Param("occurredAt") Instant occurredAt,
+                         @Param("reason") String reason);
+
+    /**
+     * Stores the latest relevant provider outcome. Callbacks can arrive out of order, so an
+     * older event is kept in the audit table but cannot overwrite the newer visible state.
+     */
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set delivery_status = cast(:deliveryStatus as varchar),
+                   provider_event_at = :occurredAt
+             where id = :notificationId
+               and status in ('SENDING', 'SENT', 'DEAD')
+               and (provider_event_at is null or provider_event_at <= :occurredAt)
+            """, nativeQuery = true)
+    int updateDeliveryStatus(@Param("notificationId") UUID notificationId,
+                             @Param("deliveryStatus") String deliveryStatus,
+                             @Param("occurredAt") Instant occurredAt);
+
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set status = 'SENT', sent_at = :occurredAt, delivered_at = :occurredAt,
+                   failure_reason = null, claim_token = null, claimed_at = null
+             where id = :notificationId and status in ('SENDING', 'DEAD')
+               and delivery_status = 'DELIVERED' and provider_event_at = :occurredAt
+            """, nativeQuery = true)
+    int markProviderDelivered(@Param("notificationId") UUID notificationId,
+                              @Param("occurredAt") Instant occurredAt);
+
+    @Transactional
+    @Modifying(clearAutomatically = true)
+    @Query(value = """
+            update notifications
+               set status = 'DEAD', sent_at = null, failure_reason = :reason,
+                   claim_token = null, claimed_at = null
+             where id = :notificationId and status in ('SENDING', 'SENT')
+               and delivery_status = cast(:deliveryStatus as varchar)
+               and provider_event_at = :occurredAt
+            """, nativeQuery = true)
+    int markProviderDead(@Param("notificationId") UUID notificationId,
+                         @Param("deliveryStatus") String deliveryStatus,
+                         @Param("occurredAt") Instant occurredAt,
+                         @Param("reason") String reason);
 
     /**
      * Releases a claim (SENDING -> PENDING) after a failed delivery attempt, so the
@@ -85,7 +161,8 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
 
     /**
      * Locks up to {@code limit} SENDING rows whose lease has expired — or that have no
-     * lease at all, which only rows stranded before V5 can lack. {@code SKIP LOCKED}
+     * lease at all, which only rows stranded before V5 can lack. Accepted rows wait for
+     * a webhook and are not reclaimed. {@code SKIP LOCKED}
      * lets several instances sweep at once without blocking on, or double-reclaiming,
      * each other's rows. Must run inside the caller's transaction: the locks are what
      * make the follow-up {@link #reclaim} safe, and they end with the transaction.
@@ -94,6 +171,7 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Query(value = """
             select id from notifications
              where status = 'SENDING'
+               and provider_accepted_at is null
                and (claimed_at is null or claimed_at < now() - :leaseMillis * interval '1 millisecond')
              order by claimed_at nulls first
              limit :limit
@@ -111,7 +189,7 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Query(value = """
             update notifications
                set status = 'PENDING', claim_token = null, claimed_at = null, published_at = null
-             where id in (:ids) and status = 'SENDING'
+             where id in (:ids) and status = 'SENDING' and provider_accepted_at is null
             """, nativeQuery = true)
     int reclaim(@Param("ids") Collection<UUID> ids);
 
@@ -159,7 +237,9 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Query(value = """
             update notifications
                set status = 'PENDING', attempts = 0, failure_reason = null,
-                   claim_token = null, claimed_at = null, published_at = null, last_attempt_at = null
+                   claim_token = null, claimed_at = null, published_at = null, last_attempt_at = null,
+                   sent_at = null, delivery_status = null, provider_event_at = null,
+                   provider_accepted_at = null, delivered_at = null
              where id = :id and status in ('PENDING', 'DEAD')
             """, nativeQuery = true)
     int resetForRedelivery(@Param("id") UUID id);
@@ -213,9 +293,16 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
     @Query(value = """
             select count(*) from notifications
              where status = 'SENDING'
+               and provider_accepted_at is null
                and (claimed_at is null or claimed_at < now() - :leaseMillis * interval '1 millisecond')
             """, nativeQuery = true)
     long countExpiredLeases(@Param("leaseMillis") long leaseMillis);
+
+    @Query(value = """
+            select count(*) from notifications
+             where status = 'SENDING' and provider_accepted_at is not null
+            """, nativeQuery = true)
+    long countAwaitingConfirmation();
 
     Optional<Notification> findByTenantIdAndIdempotencyKey(UUID tenantId, String idempotencyKey);
 

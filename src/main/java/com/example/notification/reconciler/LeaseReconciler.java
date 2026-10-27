@@ -19,9 +19,10 @@ import java.util.UUID;
  *
  * <ol>
  *   <li><b>Expired SENDING leases.</b> A consumer that dies between claiming a row and
- *       writing SENT (kill -9, OOM, a DB error after the claim) leaves it SENDING, and
+ *       recording acceptance (kill -9, OOM, a DB error after the claim) leaves it SENDING, and
  *       the broker's redelivery skips it because it is already claimed. Rows whose lease
- *       has expired go back to PENDING with {@code published_at} cleared.</li>
+ *       has expired go back to PENDING with {@code published_at} cleared. Provider-accepted
+ *       rows wait for a webhook instead.</li>
  *   <li><b>Retry-exhausted PENDING rows.</b> After its last failed attempt a row is
  *       PENDING with {@code attempts} at the retry limit, and the dead-letter handler
  *       writes DEAD. If that write keeps failing (Postgres down) the handler parks the

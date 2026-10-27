@@ -144,8 +144,8 @@ public class NotificationService {
 
     /**
      * Attempts to deliver a single notification. Invoked by the RabbitMQ listener,
-     * once per retry attempt. Claims a lease, calls the provider, and marks SENT on
-     * success.
+     * once per retry attempt. A callback-based provider stays SENDING after hand-off;
+     * only its delivered webhook marks SENT. The simulator marks SENT immediately.
      *
      * <p>On a provider failure the claim is released (back to PENDING) and
      * the exception is <b>rethrown</b> so the listener's retry interceptor can back off
@@ -157,7 +157,7 @@ public class NotificationService {
      * consumer is skipped without calling the provider.
      *
      * <p>The claim is a <b>lease</b>, not a lock held forever. If this consumer dies
-     * anywhere between the claim and the SENT write, {@code LeaseReconciler} returns
+     * anywhere before the provider-acceptance write, {@code LeaseReconciler} returns
      * the row to PENDING once the lease expires and republishes it. That makes delivery
      * at-least-once: the provider may already have accepted the notification before the
      * crash, so it can be sent again — which is why {@link NotificationProvider} must be
@@ -222,6 +222,15 @@ public class NotificationService {
             throw e;
         }
         metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
+
+        if (provider.requiresDeliveryConfirmation()) {
+            if (repository.markProviderAccepted(id, token) == 0) {
+                log.info("Provider hand-off for {} was already resolved or its lease changed", id);
+            } else {
+                log.info("Provider accepted {}; awaiting delivery webhook", id);
+            }
+            return;
+        }
 
         Instant sentAt = Instant.now();
         if (repository.markSent(id, token, sentAt) == 0) {

@@ -139,6 +139,8 @@ class NotificationIntegrationTest {
     static void redisProps(DynamicPropertyRegistry registry) {
         registry.add("spring.data.redis.host", redis::getHost);
         registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+        registry.add("notifications.brevo.webhook-username", () -> "relaynest");
+        registry.add("notifications.brevo.webhook-password", () -> "webhook-secret");
     }
 
     /** A controllable clock so the rate limiter's refill is deterministic and fast. */
@@ -1487,6 +1489,83 @@ class NotificationIntegrationTest {
         } finally {
             amqpAdmin.deleteQueue(name);
         }
+    }
+
+    @Test
+    void authenticatedBrevoWebhookRecordsDeliveryAndDeduplicatesRetries() throws Exception {
+        UUID id = postNotify("webhook-delivery@example.com");
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENT));
+        jdbcTemplate.update("""
+                update notifications set status = 'SENDING', sent_at = null, delivered_at = null,
+                    delivery_status = 'ACCEPTED', provider_accepted_at = now(),
+                    claim_token = null, claimed_at = null where id = ?
+                """, id);
+
+        mockMvc.perform(get("/notify/{id}", id)
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(jsonPath("$.status").value("SENDING"))
+                .andExpect(jsonPath("$.deliveryStatus").value("ACCEPTED"));
+
+        String payload = """
+                {"event":"delivered","id":912345,"ts_event":1767225600,
+                 "X-Mailin-custom":"notification-id:%s"}
+                """.formatted(id);
+        for (int retry = 0; retry < 2; retry++) {
+            mockMvc.perform(post("/webhooks/brevo")
+                            .header(HttpHeaders.AUTHORIZATION, "Basic cmVsYXluZXN0OndlYmhvb2stc2VjcmV0")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(payload))
+                    .andExpect(status().isNoContent());
+        }
+
+        mockMvc.perform(get("/notify/{id}", id)
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("SENT"))
+                .andExpect(jsonPath("$.deliveryStatus").value("DELIVERED"))
+                .andExpect(jsonPath("$.deliveredAt").value("2026-01-01T00:00:00Z"));
+        assertThat(jdbcTemplate.queryForObject(
+                "select count(*) from notification_delivery_events where notification_id = ?", Long.class, id))
+                .isEqualTo(1L);
+    }
+
+    @Test
+    void permanentBrevoFailureEndsTheNotificationWithoutResendingIt() throws Exception {
+        UUID id = postNotify("webhook-bounce@example.com");
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENT));
+        jdbcTemplate.update("""
+                update notifications set status = 'SENDING', sent_at = null, delivered_at = null,
+                    delivery_status = 'ACCEPTED', provider_accepted_at = now() - interval '2 hours',
+                    claim_token = null, claimed_at = null where id = ?
+                """, id);
+
+        reconciler.reclaimExpiredLeases();
+        assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENDING);
+
+        mockMvc.perform(post("/webhooks/brevo")
+                        .header(HttpHeaders.AUTHORIZATION, "Basic cmVsYXluZXN0OndlYmhvb2stc2VjcmV0")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"event":"hard_bounce","id":912346,"ts_event":1767225601,
+                                 "X-Mailin-custom":"notification-id:%s","reason":"mailbox unavailable"}
+                                """.formatted(id)))
+                .andExpect(status().isNoContent());
+
+        mockMvc.perform(get("/notify/{id}", id)
+                        .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
+                .andExpect(jsonPath("$.status").value("DEAD"))
+                .andExpect(jsonPath("$.deliveryStatus").value("HARD_BOUNCED"))
+                .andExpect(jsonPath("$.failureReason").value("mailbox unavailable"));
+    }
+
+    @Test
+    void brevoWebhookRejectsRequestsWithoutItsDedicatedCredential() throws Exception {
+        mockMvc.perform(post("/webhooks/brevo")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"event\":\"delivered\"}"))
+                .andExpect(status().isUnauthorized());
     }
 
     // ---- helpers ----

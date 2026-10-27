@@ -1,6 +1,7 @@
 package com.example.notification.api;
 
 import com.example.notification.domain.Channel;
+import com.example.notification.domain.DeliveryStatus;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 
@@ -20,7 +21,10 @@ public record NotificationView(
         int attempts,
         String failureReason,
         Instant createdAt,
-        Instant sentAt
+        Instant sentAt,
+        DeliveryStatus deliveryStatus,
+        Instant providerAcceptedAt,
+        Instant deliveredAt
 ) {
 
     public static NotificationView from(Notification n) {
@@ -34,7 +38,10 @@ public record NotificationView(
                 n.getAttempts(),
                 n.getFailureReason(),
                 n.getCreatedAt(),
-                n.getSentAt()
+                n.getSentAt(),
+                n.getDeliveryStatus(),
+                n.getProviderAcceptedAt(),
+                n.getDeliveredAt()
         );
     }
 }

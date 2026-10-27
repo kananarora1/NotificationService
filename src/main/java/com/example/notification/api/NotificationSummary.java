@@ -1,6 +1,7 @@
 package com.example.notification.api;
 
 import com.example.notification.domain.Channel;
+import com.example.notification.domain.DeliveryStatus;
 import com.example.notification.domain.Notification;
 import com.example.notification.domain.NotificationStatus;
 
@@ -19,7 +20,10 @@ public record NotificationSummary(
         NotificationStatus status,
         int attempts,
         Instant createdAt,
-        Instant sentAt
+        Instant sentAt,
+        DeliveryStatus deliveryStatus,
+        Instant providerAcceptedAt,
+        Instant deliveredAt
 ) {
 
     public static NotificationSummary of(Notification n, String tenant) {
@@ -31,7 +35,10 @@ public record NotificationSummary(
                 n.getStatus(),
                 n.getAttempts(),
                 n.getCreatedAt(),
-                n.getSentAt()
+                n.getSentAt(),
+                n.getDeliveryStatus(),
+                n.getProviderAcceptedAt(),
+                n.getDeliveredAt()
         );
     }
 }
