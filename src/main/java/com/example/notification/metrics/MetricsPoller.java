@@ -13,6 +13,7 @@ import org.springframework.amqp.rabbit.core.RabbitAdmin;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code notifications.pending} — count of PENDING rows (a COUNT query we do not
  *       want to run per scrape on a large table).</li>
  *   <li>{@code notifications.sending} — claimed or awaiting provider confirmation.</li>
+ *   <li>{@code notifications.overdue_confirmation} — Brevo-accepted rows older than 30 minutes.</li>
  *   <li>{@code notifications.stuck_sending} — SENDING rows past their lease, i.e. what
  *       the reconciler should be recovering. It drains every sweep, so a value that
  *       stays above zero means the reconciler itself is not working.</li>
@@ -42,6 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class MetricsPoller {
 
     private static final Logger log = LoggerFactory.getLogger(MetricsPoller.class);
+    private static final Duration CONFIRMATION_TIMEOUT = Duration.ofMinutes(30);
 
     private final NotificationRepository repository;
     private final AmqpAdmin amqpAdmin;
@@ -51,6 +54,7 @@ public class MetricsPoller {
     private final AtomicLong sending = new AtomicLong();
     private final AtomicLong stuckSending = new AtomicLong();
     private final AtomicLong awaitingConfirmation = new AtomicLong();
+    private final AtomicLong overdueConfirmation = new AtomicLong();
     private final AtomicLong unpublishedPending = new AtomicLong();
     private final AtomicLong sendQueueDepth = new AtomicLong();
     private final AtomicLong dlqDepth = new AtomicLong();
@@ -75,6 +79,9 @@ public class MetricsPoller {
                 .register(registry);
         Gauge.builder("notifications.awaiting_confirmation", awaitingConfirmation, AtomicLong::get)
                 .description("Provider-accepted notifications waiting for a delivery webhook")
+                .register(registry);
+        Gauge.builder("notifications.overdue_confirmation", overdueConfirmation, AtomicLong::get)
+                .description("Provider-accepted notifications waiting over 30 minutes for a delivery webhook")
                 .register(registry);
         Gauge.builder("notifications.unpublished_pending", unpublishedPending, AtomicLong::get)
                 .description("PENDING notifications with no confirmed message past the publish grace")
@@ -102,6 +109,7 @@ public class MetricsPoller {
             sending.set(repository.countByStatus(NotificationStatus.SENDING));
             stuckSending.set(repository.countExpiredLeases(reconcilerProperties.leaseTimeout().toMillis()));
             awaitingConfirmation.set(repository.countAwaitingConfirmation());
+            overdueConfirmation.set(repository.countOverdueConfirmations(CONFIRMATION_TIMEOUT.toMillis()));
             unpublishedPending.set(repository.countUnpublishedPending(reconcilerProperties.publishGrace().toMillis()));
         } catch (RuntimeException e) {
             log.warn("Failed to refresh the database gauges", e);

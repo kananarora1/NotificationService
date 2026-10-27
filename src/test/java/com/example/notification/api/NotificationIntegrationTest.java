@@ -1496,11 +1496,21 @@ class NotificationIntegrationTest {
         UUID id = postNotify("webhook-delivery@example.com");
         await().atMost(Duration.ofSeconds(10)).untilAsserted(() ->
                 assertThat(repository.findById(id).orElseThrow().getStatus()).isEqualTo(NotificationStatus.SENT));
+        long overdueBefore = repository.countOverdueConfirmations(Duration.ofMinutes(30).toMillis());
         jdbcTemplate.update("""
                 update notifications set status = 'SENDING', sent_at = null, delivered_at = null,
                     delivery_status = 'ACCEPTED', provider_accepted_at = now(),
                     claim_token = null, claimed_at = null where id = ?
                 """, id);
+        assertThat(repository.countOverdueConfirmations(Duration.ofMinutes(30).toMillis()))
+                .isEqualTo(overdueBefore);
+        jdbcTemplate.update("""
+                update notifications set provider_accepted_at = now() - interval '31 minutes'
+                where id = ?
+                """, id);
+        metricsPoller.pollDatabase();
+        assertThat(meterRegistry.find("notifications.overdue_confirmation").gauge().value())
+                .isEqualTo(overdueBefore + 1);
 
         mockMvc.perform(get("/notify/{id}", id)
                         .header(ApiKeyAuthInterceptor.API_KEY_HEADER, ACME_KEY))
@@ -1528,6 +1538,9 @@ class NotificationIntegrationTest {
         assertThat(jdbcTemplate.queryForObject(
                 "select count(*) from notification_delivery_events where notification_id = ?", Long.class, id))
                 .isEqualTo(1L);
+        metricsPoller.pollDatabase();
+        assertThat(meterRegistry.find("notifications.overdue_confirmation").gauge().value())
+                .isEqualTo(overdueBefore);
     }
 
     @Test

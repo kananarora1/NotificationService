@@ -304,6 +304,13 @@ public interface NotificationRepository extends JpaRepository<Notification, UUID
             """, nativeQuery = true)
     long countAwaitingConfirmation();
 
+    @Query(value = """
+            select count(*) from notifications
+             where status = 'SENDING'
+               and provider_accepted_at < now() - :ageMillis * interval '1 millisecond'
+            """, nativeQuery = true)
+    long countOverdueConfirmations(@Param("ageMillis") long ageMillis);
+
     Optional<Notification> findByTenantIdAndIdempotencyKey(UUID tenantId, String idempotencyKey);
 
     long countByStatus(NotificationStatus status);

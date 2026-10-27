@@ -254,6 +254,23 @@ groups:
             (`rabbitmqctl status`), and the app logs for "Could not publish" or
             "No broker confirm".
 
+      # Brevo accepted these messages, but no delivery or permanent-failure webhook
+      # resolved them within 30 minutes. Count aged rows, not a continuously non-zero
+      # total of fresh hand-offs, which could alert falsely under steady traffic.
+      - alert: BrevoDeliveryConfirmationOverdue
+        expr: max(notifications_overdue_confirmation) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Brevo delivery confirmation is overdue"
+          description: >-
+            {{ $value | printf "%.0f" }} notification(s) have waited over 30 minutes
+            since Brevo accepted them without a delivery or permanent-failure webhook.
+            Check Brevo webhook configuration and delivery logs, then inspect the
+            SENDING rows with provider_accepted_at older than 30 minutes. Do not resend
+            automatically: Brevo may already have delivered them.
+
   - name: notification-service-availability
     rules:
 
