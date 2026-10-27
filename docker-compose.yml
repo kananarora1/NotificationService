@@ -55,6 +55,26 @@ services:
       # Lets the container reach the app running on the host (both 8080 and 8081).
       - "host.docker.internal:host-gateway"
 
+  alertmanager:
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    profiles: [alerts]
+    container_name: notification-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    user: "65534:65534"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - notification-alertmanager:/alertmanager
+    secrets:
+      - alertmanager_gmail_app_password
+
   grafana:
     image: grafana/grafana:latest
     container_name: notification-grafana
@@ -99,3 +119,8 @@ volumes:
   notification-rabbitmq:
   notification-redis:
   notification-grafana:
+  notification-alertmanager:
+
+secrets:
+  alertmanager_gmail_app_password:
+    file: ./.secrets/alertmanager-gmail-app-password

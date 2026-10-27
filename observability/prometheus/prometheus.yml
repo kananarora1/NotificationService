@@ -7,13 +7,10 @@ global:
 rule_files:
   - /etc/prometheus/alerts.yml
 
-# Optional: to actually route these somewhere (email/Slack/PagerDuty), run an
-# Alertmanager and uncomment the block below. Not required — the rules are fully
-# visible in the Prometheus UI without it.
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ["alertmanager:9093"]
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
 
 scrape_configs:
   - job_name: notification-service

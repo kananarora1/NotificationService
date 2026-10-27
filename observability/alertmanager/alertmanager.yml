@@ -1,0 +1,24 @@
+global:
+  smtp_smarthost: smtp.gmail.com:587
+  smtp_from: arorakanan63@gmail.com
+  smtp_auth_username: arorakanan63@gmail.com
+  smtp_auth_password_file: /run/secrets/alertmanager_gmail_app_password
+  smtp_require_tls: true
+
+route:
+  receiver: discard
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - receiver: gmail
+      matchers:
+        - alertname="BrevoDeliveryConfirmationOverdue"
+
+receivers:
+  - name: discard
+  - name: gmail
+    email_configs:
+      - to: arorakanan63@gmail.com
+        send_resolved: true
