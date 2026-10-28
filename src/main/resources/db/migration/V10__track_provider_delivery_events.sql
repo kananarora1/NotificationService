@@ -7,11 +7,8 @@ ALTER TABLE notifications
     ADD COLUMN provider_accepted_at timestamp(6) with time zone,
     ADD COLUMN delivered_at timestamp(6) with time zone;
 
--- Older SENT rows predate provider callbacks. Their delivery was not confirmed.
-UPDATE notifications
-   SET status = 'SENDING', delivery_status = 'ACCEPTED',
-       provider_accepted_at = coalesce(sent_at, created_at), sent_at = null
- WHERE status = 'SENT';
+-- Legacy SENT rows have no provider event. Keep their status and sent_at intact;
+-- delivery_status stays NULL because their delivery cannot be verified retroactively.
 
 CREATE TABLE notification_delivery_events (
     id                bigserial                   NOT NULL,
