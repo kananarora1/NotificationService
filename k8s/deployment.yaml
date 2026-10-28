@@ -5,7 +5,7 @@ metadata:
   namespace: notification-service
   labels:
     app.kubernetes.io/name: notification-service
-    app.kubernetes.io/version: e5727d646fb18f3fa88044de8f5e4097aff7b339
+    app.kubernetes.io/version: af57760a60dbc074cf6b4f251be9611627ec0d27
 spec:
   replicas: 1
   selector:
@@ -15,7 +15,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: notification-service
-        app.kubernetes.io/version: e5727d646fb18f3fa88044de8f5e4097aff7b339
+        app.kubernetes.io/version: af57760a60dbc074cf6b4f251be9611627ec0d27
     spec:
       terminationGracePeriodSeconds: 90
       automountServiceAccountToken: false
@@ -27,7 +27,7 @@ spec:
         runAsGroup: 10001
       containers:
         - name: notification-service
-          image: ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339@sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8
+          image: ghcr.io/kananarora1/notification-service:af57760a60dbc074cf6b4f251be9611627ec0d27
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
