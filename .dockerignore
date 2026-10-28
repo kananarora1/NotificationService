@@ -4,6 +4,7 @@
 
 .git
 .gitignore
+.secrets
 target
 .idea
 .vscode
