@@ -3,9 +3,12 @@ kind: Deployment
 metadata:
   name: notification-service
   namespace: notification-service
+  annotations:
+    relaynest.tech/release-template-sha256: TEMPLATE_SHA256
+    kubernetes.io/change-cause: "Deploy ghcr.io/kananarora1/notification-service:RELEASE_SHA"
   labels:
     app.kubernetes.io/name: notification-service
-    app.kubernetes.io/version: af57760a60dbc074cf6b4f251be9611627ec0d27
+    app.kubernetes.io/version: RELEASE_SHA
 spec:
   replicas: 1
   selector:
@@ -15,7 +18,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: notification-service
-        app.kubernetes.io/version: af57760a60dbc074cf6b4f251be9611627ec0d27
+        app.kubernetes.io/version: RELEASE_SHA
     spec:
       terminationGracePeriodSeconds: 90
       automountServiceAccountToken: false
@@ -27,7 +30,7 @@ spec:
         runAsGroup: 10001
       containers:
         - name: notification-service
-          image: ghcr.io/kananarora1/notification-service:af57760a60dbc074cf6b4f251be9611627ec0d27
+          image: ghcr.io/kananarora1/notification-service:RELEASE_SHA
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

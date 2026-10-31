@@ -12,6 +12,7 @@ mkdir -p "$(dirname "$plist")" "$(dirname "$log_file")"
 install -d -m 700 "$install_dir"
 install -m 700 "$repo_dir/scripts/deploy-latest-kind-image.sh" "$install_dir/deploy-latest-kind-image.sh"
 install -m 700 "$repo_dir/scripts/load-kind-image.sh" "$install_dir/load-kind-image.sh"
+install -m 600 "$repo_dir/k8s/deployment-template.yaml" "$install_dir/deployment-template.yaml"
 launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
 
 plutil -create xml1 "$plist"

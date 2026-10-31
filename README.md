@@ -69,22 +69,36 @@ Keep Docker Desktop running. Run commands from the repository root.
    credentials, but base64 encoding is not encryption; cluster access still matters.
    Credentials enter the application through environment variables. Changing a
    Secret or ConfigMap requires an application rollout to refresh those variables.
-
-4. Load the CI image and apply the manifests:
+   The kind Alertmanager also needs its Gmail App Password as a separate Secret:
 
    ```bash
-   IMAGE=ghcr.io/kananarora1/notification-service:e5727d646fb18f3fa88044de8f5e4097aff7b339@sha256:322b8523a7886efb4b19797a0b393879db4089f9488dcaf9ed8afb0da2efaed8
-   bash scripts/load-kind-image.sh "$IMAGE"
+   kubectl --context kind-relaynest -n notification-service create secret generic \
+     alertmanager-gmail \
+     --from-file=alertmanager_gmail_app_password=.secrets/alertmanager-gmail-app-password \
+     --dry-run=client -o yaml | kubectl --context kind-relaynest -n notification-service apply -f -
+   ```
+
+   Keep the source file outside Git. This command does not print its contents.
+
+4. Apply shared resources, then deploy the latest image published by passing CI:
+
+   ```bash
    kubectl --context kind-relaynest apply -k k8s
+   bash scripts/deploy-latest-kind-image.sh
+   bash scripts/install-kind-deployer.sh
    kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
    kubectl --context kind-relaynest -n notification-service rollout status deployment/prometheus --timeout=180s
    ```
 
    For a private GHCR package, first authenticate with `docker login ghcr.io`
    using a credential permitted to read it. Do not print or commit the credential.
-   The loader exports only the node's CPU architecture, avoiding kind's failure to
+   The deployer loads only the node's CPU architecture, avoiding kind's failure to
    import missing variants from a multi-platform Docker image. Images are preloaded
    into kind; no registry credentials are mounted into application pods.
+   The macOS LaunchAgent checks `main` every two minutes while the Mac and Docker
+   Desktop are running. Re-run `scripts/install-kind-deployer.sh` after changing the
+   deployer or its template. Its log is at
+   `~/Library/Logs/relaynest-kind-deployer.log`.
    Flyway initializes a fresh database automatically. Do not reset an existing
    database just to silence a migration warning; check its history first.
 
@@ -112,10 +126,14 @@ have no package write permission. Publishing uses the job-scoped `GITHUB_TOKEN` 
 Actions are pinned to commit hashes, jobs have time limits, and test reports are
 retained as workflow artifacts for 14 days.
 
-The release boundary is manual: choose a successful run, load its full-SHA image,
-update the image and both version labels in `k8s/deployment.yaml`, commit, and apply.
-The image source commit and the later configuration commit can differ. Record both
-in the PR; do not imply that updating a manifest changes an already-built image.
+The local release boundary is automatic: the deployer reads `main`, waits until its
+full-SHA image is available from the test-gated publish job, verifies the image's
+revision label, renders `k8s/deployment-template.yaml`, and waits for rollout
+readiness. A failed rollout is undone when a prior revision exists, and that SHA
+is held for inspection. The application Deployment is deliberately excluded from
+`k8s/kustomization.yaml`, so
+reapplying shared manifests cannot revert it to an older hard-coded image.
+The Mac is not a GitHub Actions runner, and deployments stop while it is offline.
 A SHA tag is traceable but registry tags can technically be overwritten. Record
 the registry digest as the immutable artifact identity too:
 
@@ -137,22 +155,25 @@ A single-platform kind import can report a different local index/imageID; retain
 the platform manifest and revision label when comparing the imported artifact.
 
 Rollback was demonstrated to revision 2, followed by restoration of the intended
-release. For a new demonstration, inspect history and choose the prior revision:
+release. Pause the local deployer before a manual rollback; otherwise it will
+deploy the latest passing `main` image again on its next check:
 
 ```bash
+touch "$HOME/Library/Application Support/RelayNest/kind-deployer/paused"
 kubectl --context kind-relaynest -n notification-service rollout history deployment/notification-service
 kubectl --context kind-relaynest -n notification-service rollout undo deployment/notification-service --to-revision=<previous-revision>
 kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
-kubectl --context kind-relaynest apply -k k8s
+unlink "$HOME/Library/Application Support/RelayNest/kind-deployer/paused" # only after approving the latest release
+bash scripts/deploy-latest-kind-image.sh
 kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
 ```
 
 `rollout undo` restores the pod template, not the database or ConfigMap/Secret
-contents, and does not update kubectl's last-applied annotation. The repeatable
-release rollback is to reapply a reviewed earlier manifest from Git and verify
-health and a request. Ensure the previous image is still available. Database
-migrations must remain backward compatible; an image rollback cannot undo schema
-changes. Keep the repository's intended manifest consistent with the chosen release.
+contents. Keep the pause file in place while investigating a bad release; remove
+it only when ready to resume automatic deployment. A rollback also needs the
+previous image to remain available. Database migrations must remain backward
+compatible; an image rollback cannot undo schema changes. The template stays in
+Git, while the active release is the deployed SHA shown by Kubernetes.
 
 ### Verification and observability
 
@@ -226,7 +247,7 @@ Be ready to explain:
 
 - Why a replaceable Deployment suits the app while durable data lives in PostgreSQL.
 - How a request becomes a database row, queued ID, delivery attempt and final status.
-- How Java 21 tests gate image publishing, and why local deployment has a manual boundary.
+- How Java 21 tests gate image publishing, and why local deployment stops when the Mac is offline.
 - How tags, image digests, revision labels and configuration commits relate.
 - Why startup/liveness differ from readiness and why rollback cannot undo migrations.
 - How notification IDs, failed-attempt counters, DEAD counts and latency identify failures.
@@ -1111,8 +1132,10 @@ into Prometheus and visible at **http://localhost:9090/alerts**. Every threshold
 commented in the file so it is easy to tune — they are sized for the demo scale, not
 for production traffic.
 
-Alertmanager is **not** wired up; the rules are fully usable from the Prometheus UI
-without it. `prometheus.yml` has a commented `alerting:` block if you want to add one.
+For this host-run Compose setup, Alertmanager is **not** wired up by default; the
+rules are usable from the Prometheus UI without it. `prometheus.yml` has a commented
+`alerting:` block. The kind setup above has its own Alertmanager and overdue-delivery
+alert.
 
 | alert | fires when | what a responder does |
 |---|---|---|
