@@ -35,6 +35,19 @@ data:
                 since Brevo accepted them without a delivery or permanent-failure webhook.
                 Check Brevo webhook configuration and delivery logs. Do not resend
                 automatically: Brevo may already have delivered them.
+      - name: notification-service-rate-limiter
+        rules:
+          - alert: RedisRateLimiterFailOpen
+            expr: sum(increase(ratelimit_fail_open_total[5m])) >= 3
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Notification requests are bypassing rate limits"
+              description: >-
+                {{ $value | printf "%.0f" }} requests bypassed rate limiting in the last
+                5 minutes because Redis calls failed. Check Redis and its connection
+                from the application. Requests are still being accepted.
 ---
 apiVersion: apps/v1
 kind: Deployment

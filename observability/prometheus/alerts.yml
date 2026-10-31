@@ -296,6 +296,20 @@ groups:
             instance, the service is down and POST /notify is unavailable. Responder:
             check the process is alive and /actuator/health is reachable.
 
+  - name: notification-service-rate-limiter
+    rules:
+      - alert: RedisRateLimiterFailOpen
+        expr: sum(increase(ratelimit_fail_open_total[5m])) >= 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification requests are bypassing rate limits"
+          description: >-
+            {{ $value | printf "%.0f" }} requests bypassed rate limiting in the last
+            5 minutes because Redis calls failed. Check Redis and its connection
+            from the application. Requests are still being accepted.
+
   - name: notification-service-abuse
     rules:
 
