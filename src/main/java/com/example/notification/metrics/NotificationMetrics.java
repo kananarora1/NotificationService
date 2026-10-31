@@ -26,6 +26,7 @@ public class NotificationMetrics {
     private final Counter reclaimed;
     private final Counter republished;
     private final Counter deadReconciled;
+    private final Counter rateLimitFailOpen;
 
     public NotificationMetrics(MeterRegistry registry, TenantRepository tenants) {
         this.registry = registry;
@@ -41,6 +42,9 @@ public class NotificationMetrics {
                 .register(registry);
         this.deadReconciled = Counter.builder("notifications.dead_reconciled")
                 .description("Retry-exhausted rows the reconciler marked DEAD because the dead-letter handler could not")
+                .register(registry);
+        this.rateLimitFailOpen = Counter.builder("ratelimit.fail_open")
+                .description("Requests admitted because the Redis rate limiter failed")
                 .register(registry);
     }
 
@@ -91,6 +95,10 @@ public class NotificationMetrics {
     /** A request was rejected by the rate limiter (429). */
     public void rateLimitRejected(String tenant) {
         registry.counter("ratelimit.rejected", "tenant", tenant).increment();
+    }
+
+    public void rateLimitFailOpen() {
+        rateLimitFailOpen.increment();
     }
 
     /** Duration of a single provider.send() call. */

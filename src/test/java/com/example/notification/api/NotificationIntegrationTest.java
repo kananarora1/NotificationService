@@ -10,6 +10,7 @@ import com.example.notification.messaging.ParkingLot;
 import com.example.notification.messaging.QueueArgumentsCheck;
 import com.example.notification.messaging.RabbitConfig;
 import com.example.notification.metrics.MetricsPoller;
+import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.provider.NotificationProvider;
 import com.example.notification.provider.SimulatedProvider;
 import com.example.notification.ratelimit.RateLimiter;
@@ -260,6 +261,9 @@ class NotificationIntegrationTest {
 
     @Autowired
     private MeterRegistry meterRegistry;
+
+    @Autowired
+    private NotificationMetrics notificationMetrics;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -711,8 +715,8 @@ class NotificationIntegrationTest {
         // Two RateLimiter instances stand in for two app instances behind a load
         // balancer, both pointed at the SAME Redis. This is exactly the scenario that
         // over-admitted in v6 (each instance had its own in-memory bucket -> 2x limit).
-        RateLimiter instanceA = new RateLimiter(redisTemplate, tokenBucketScript, clock);
-        RateLimiter instanceB = new RateLimiter(redisTemplate, tokenBucketScript, clock);
+        RateLimiter instanceA = new RateLimiter(redisTemplate, tokenBucketScript, clock, notificationMetrics);
+        RateLimiter instanceB = new RateLimiter(redisTemplate, tokenBucketScript, clock, notificationMetrics);
 
         Tenant globex = tenantByKey(GLOBEX_KEY);
         int limit = globex.getRateLimitPerMinute(); // 10
@@ -795,6 +799,7 @@ class NotificationIntegrationTest {
                 .contains("notifications_failed_attempt_total")
                 .contains("notifications_dead_total")
                 .contains("ratelimit_rejected_total")
+                .contains("ratelimit_fail_open_total")
                 .contains("notifications_delivery_latency_seconds")
                 .contains("notifications_end_to_end_latency_seconds")
                 .contains("notifications_pending")

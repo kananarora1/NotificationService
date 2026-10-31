@@ -1,5 +1,6 @@
 package com.example.notification.ratelimit;
 
+import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.tenant.Tenant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,13 +37,16 @@ public class RateLimiter {
     private final StringRedisTemplate redis;
     private final RedisScript<List> tokenBucketScript;
     private final Clock clock;
+    private final NotificationMetrics metrics;
 
     public RateLimiter(StringRedisTemplate redis,
                        RedisScript<List> tokenBucketScript,
-                       Clock clock) {
+                       Clock clock,
+                       NotificationMetrics metrics) {
         this.redis = redis;
         this.tokenBucketScript = tokenBucketScript;
         this.clock = clock;
+        this.metrics = metrics;
     }
 
     public RateLimitDecision tryConsume(Tenant tenant) {
@@ -70,6 +74,7 @@ public class RateLimiter {
             return RateLimitDecision.deny(retryAfterSeconds);
         } catch (RuntimeException e) {
             if (FAIL_OPEN) {
+                metrics.rateLimitFailOpen();
                 log.warn("Rate-limiter Redis call failed; failing OPEN for tenant {}", tenant.getId(), e);
                 return RateLimitDecision.allow();
             }
