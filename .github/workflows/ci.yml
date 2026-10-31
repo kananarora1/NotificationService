@@ -54,7 +54,7 @@ jobs:
           platforms: linux/arm64
           tags: notification-service:scan-${{ github.sha }}
           cache-from: type=gha
-      - name: Report image and dependency vulnerabilities
+      - name: Report image and runtime dependency vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: notification-service:scan-${{ github.sha }}
@@ -65,26 +65,11 @@ jobs:
           output: trivy-image.txt
           exit-code: "0"
           timeout: 10m
-      - name: Report source dependency vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          version: v0.76.1
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          format: table
-          output: trivy-dependencies.txt
-          exit-code: "0"
-          timeout: 10m
-          skip-setup-trivy: true
-      - name: Save vulnerability reports
+      - name: Save vulnerability report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vulnerability-report-${{ github.sha }}
-          path: |
-            trivy-image.txt
-            trivy-dependencies.txt
+          path: trivy-image.txt
           if-no-files-found: error
           retention-days: 14
 
