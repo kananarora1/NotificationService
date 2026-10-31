@@ -26,7 +26,7 @@ spring:
   data:
     redis:
       # Matches production; host/port come from the Redis container.
-      timeout: 200ms
+      timeout: 500ms
   rabbitmq:
     # Same publish guarantees as production: create() and the reconciler wait for these.
     publisher-confirm-type: correlated
