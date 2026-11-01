@@ -5,7 +5,7 @@ import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.repository.NotificationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.amqp.RabbitProperties;
+import org.springframework.boot.amqp.autoconfigure.RabbitProperties;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -68,7 +68,7 @@ public class LeaseReconciler {
         this.metrics = metrics;
         this.transactionTemplate = transactionTemplate;
         this.properties = properties;
-        this.maxAttempts = rabbitProperties.getListener().getSimple().getRetry().getMaxAttempts();
+        this.maxAttempts = Math.toIntExact(rabbitProperties.getListener().getSimple().getRetry().getMaxRetries() + 1);
     }
 
     /**

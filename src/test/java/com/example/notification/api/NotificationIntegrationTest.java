@@ -41,11 +41,11 @@ import org.springframework.amqp.rabbit.listener.AbstractMessageListenerContainer
 import org.springframework.amqp.rabbit.listener.MessageListenerContainer;
 import org.springframework.amqp.rabbit.listener.RabbitListenerEndpointRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.micrometer.metrics.test.autoconfigure.AutoConfigureMetrics;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
-import org.springframework.boot.test.mock.mockito.SpyBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
@@ -112,7 +112,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest
 @AutoConfigureMockMvc
-@AutoConfigureObservability // enable the real (Prometheus) meter registry in tests, not just SimpleMeterRegistry
+@AutoConfigureMetrics
 @Testcontainers
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class NotificationIntegrationTest {
@@ -225,7 +225,7 @@ class NotificationIntegrationTest {
     private RecordingProvider provider;
 
     /** Real service; a test can make one call fail unexpectedly to exercise the 500 path. */
-    @SpyBean
+    @MockitoSpyBean
     private NotificationService service;
 
     @Autowired
@@ -235,7 +235,7 @@ class NotificationIntegrationTest {
     private TransactionTemplate transactionTemplate;
 
     /** Real template; a test can make one send fail the way it does while the broker is down. */
-    @SpyBean
+    @MockitoSpyBean
     private RabbitTemplate rabbitTemplate;
 
     @Autowired

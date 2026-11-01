@@ -13,7 +13,7 @@ import java.util.UUID;
  * are configured under {@code spring.rabbitmq.listener.simple.*}. When
  * {@link NotificationService#attemptDelivery(UUID)} throws (a provider failure),
  * the retry interceptor backs off and re-invokes this method. Once
- * {@code retry.max-attempts} is reached the message is rejected without requeue and
+ * {@code retry.max-retries} is reached the message is rejected without requeue and
  * RabbitMQ dead-letters it to {@code notifications.dlq}.
  */
 @Component

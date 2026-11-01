@@ -11,7 +11,7 @@ import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFacto
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
 import org.springframework.amqp.rabbit.retry.RejectAndDontRequeueRecoverer;
-import org.springframework.boot.autoconfigure.amqp.SimpleRabbitListenerContainerFactoryConfigurer;
+import org.springframework.boot.amqp.autoconfigure.SimpleRabbitListenerContainerFactoryConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -129,7 +129,7 @@ public class RabbitConfig {
         factory.setDefaultRequeueRejected(false);
         DeadLetterProperties.Retry retry = properties.retry();
         factory.setAdviceChain(RetryInterceptorBuilder.stateless()
-                .maxAttempts(retry.maxAttempts())
+                .maxRetries(retry.maxAttempts() - 1)
                 .backOffOptions(retry.initialInterval().toMillis(), retry.multiplier(),
                         retry.maxInterval().toMillis())
                 .recoverer(new RejectAndDontRequeueRecoverer())

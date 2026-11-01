@@ -4,10 +4,9 @@ import com.example.notification.ratelimit.RateLimitExceededException;
 import com.example.notification.service.IdempotencyConflictException;
 import com.example.notification.service.NotificationNotFoundException;
 import com.example.notification.web.ApiAuthenticationException;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.exc.InvalidFormatException;
-import com.fasterxml.jackson.databind.exc.MismatchedInputException;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.exc.InvalidFormatException;
+import tools.jackson.databind.exc.MismatchedInputException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -134,7 +133,7 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         if (cause instanceof MismatchedInputException mismatch && !mismatch.getPath().isEmpty()) {
             Object value = mismatch instanceof InvalidFormatException format ? format.getValue() : null;
             problem = badRequest(List.of(new FieldProblem(path(mismatch), invalidValue(value, mismatch.getTargetType()))));
-        } else if (cause instanceof JsonProcessingException json && json.getLocation() != null) {
+        } else if (cause instanceof JacksonException json && json.getLocation() != null) {
             problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
                     "Malformed JSON request body (line %d, column %d)."
                             .formatted(json.getLocation().getLineNr(), json.getLocation().getColumnNr()));
@@ -200,9 +199,9 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return "a " + type.getSimpleName();
     }
 
-    private static String path(JsonMappingException e) {
+    private static String path(JacksonException e) {
         return e.getPath().stream()
-                .map(ref -> ref.getFieldName() != null ? ref.getFieldName() : "[" + ref.getIndex() + "]")
+                .map(ref -> ref.getPropertyName() != null ? ref.getPropertyName() : "[" + ref.getIndex() + "]")
                 .collect(Collectors.joining(".")).replace(".[", "[");
     }
 

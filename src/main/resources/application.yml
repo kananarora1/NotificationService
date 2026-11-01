@@ -80,7 +80,7 @@ spring:
         default-requeue-rejected: false   # exhausted retries are dead-lettered, not requeued
         retry:
           enabled: true
-          max-attempts: 4
+          max-retries: 3
           initial-interval: 1000   # 1s before the first retry
           multiplier: 2.0          # then 2s, 4s, ...
           max-interval: 10000      # capped at 10s
@@ -124,7 +124,7 @@ notifications:
     # An unpublished PENDING row younger than this is left alone: its create() may still
     # be publishing it. Must exceed connection-timeout + publisher.confirm-timeout (10s).
     publish-grace: ${RECONCILER_PUBLISH_GRACE:15s}
-    # A PENDING row that has used up its retries (attempts >= retry.max-attempts) and
+    # A PENDING row that has used up its retries (attempts > retry.max-retries) and
     # whose last attempt began longer ago than this is marked DEAD by the reconciler: its
     # dead-letter handler could not write DEAD. Must exceed one provider call plus the
     # dead-letter retry below (~1.5s), so the handler normally records it first.

@@ -7,7 +7,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.3.5</version>
+        <version>4.0.9</version>
         <relativePath/>
     </parent>
 
@@ -19,6 +19,7 @@
 
     <properties>
         <java.version>21</java.version>
+        <rabbit-amqp-client.version>5.33.1</rabbit-amqp-client.version>
         <!--
           Bump Testcontainers so its bundled (shaded) docker-java client knows Docker
           API 1.44, the minimum required by Docker Engine 29. Combined with the surefire
@@ -31,7 +32,7 @@
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -40,6 +41,10 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-jackson2</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -59,14 +64,10 @@
             <scope>runtime</scope>
         </dependency>
 
-        <!--
-          Schema is managed by Flyway (src/main/resources/db/migration), not by
-          Hibernate — ddl-auto is 'validate'. flyway-database-postgresql carries the
-          Postgres dialect support, which Flyway 10 no longer bundles in core.
-        -->
+        <!-- Flyway owns the schema; Hibernate only validates it. -->
         <dependency>
-            <groupId>org.flywaydb</groupId>
-            <artifactId>flyway-core</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
         </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>
@@ -82,6 +83,16 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-micrometer-metrics-test</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
