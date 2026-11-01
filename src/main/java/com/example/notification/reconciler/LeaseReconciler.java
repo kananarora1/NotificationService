@@ -10,6 +10,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -150,7 +151,7 @@ public class LeaseReconciler {
     public int republishUnpublished() {
         List<UUID> candidates = repository.findUnpublishedPending(
                 properties.publishGrace().toMillis(), properties.batchSize());
-        int republished = 0;
+        List<UUID> republishedIds = new ArrayList<>();
         for (UUID id : candidates) {
             Boolean confirmed = transactionTemplate.execute(tx -> {
                 if (repository.lockUnpublishedPending(id).isEmpty()) {
@@ -168,14 +169,14 @@ public class LeaseReconciler {
                 break;
             }
             if (Boolean.TRUE.equals(confirmed)) {
-                republished++;
+                republishedIds.add(id);
             }
         }
-        if (republished > 0) {
-            metrics.republished(republished);
-            log.warn("Republished {} PENDING notification(s) that had no confirmed message on the broker",
-                    republished);
+        if (!republishedIds.isEmpty()) {
+            metrics.republished(republishedIds.size());
+            log.warn("Republished {} PENDING notification(s) that had no confirmed message on the broker: {}",
+                    republishedIds.size(), republishedIds);
         }
-        return republished;
+        return republishedIds.size();
     }
 }

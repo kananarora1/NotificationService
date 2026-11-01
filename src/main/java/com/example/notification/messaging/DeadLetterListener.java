@@ -1,6 +1,7 @@
 package com.example.notification.messaging;
 
 import com.example.notification.service.NotificationService;
+import org.slf4j.MDC;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.stereotype.Component;
@@ -33,7 +34,10 @@ public class DeadLetterListener {
             containerFactory = RabbitConfig.DEAD_LETTER_CONTAINER_FACTORY)
     public void onDeadLetter(String notificationId,
                              @Header(name = "x-death", required = false) List<Map<String, ?>> xDeath) {
-        service.markDead(UUID.fromString(notificationId), describe(xDeath));
+        UUID id = UUID.fromString(notificationId);
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("notificationId", id.toString())) {
+            service.markDead(id, describe(xDeath));
+        }
     }
 
     /** Builds a short human-readable reason from RabbitMQ's x-death header, if present. */

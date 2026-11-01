@@ -76,6 +76,6 @@ public class SimulatedProvider implements NotificationProvider {
             log.info("already delivered {}; acknowledging the repeat send without delivering", notification.getId());
             return;
         }
-        log.info("sent to {} via {}", recipient, notification.getChannel());
+        log.info("Simulated delivery sent for notification {} via {}", notification.getId(), notification.getChannel());
     }
 }

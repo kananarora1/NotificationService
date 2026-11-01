@@ -1,6 +1,7 @@
 package com.example.notification.messaging;
 
 import com.example.notification.service.NotificationService;
+import org.slf4j.MDC;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
@@ -27,6 +28,9 @@ public class NotificationListener {
 
     @RabbitListener(queues = RabbitConfig.SEND_QUEUE)
     public void onNotification(String notificationId) {
-        service.attemptDelivery(UUID.fromString(notificationId));
+        UUID id = UUID.fromString(notificationId);
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("notificationId", id.toString())) {
+            service.attemptDelivery(id);
+        }
     }
 }

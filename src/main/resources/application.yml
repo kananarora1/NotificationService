@@ -92,6 +92,10 @@ server:
   # spring.lifecycle.timeout-per-shutdown-phase below.
   shutdown: graceful
 
+logging:
+  pattern:
+    level: "%5p [notificationId=%X{notificationId:-none}]"
+
 notifications:
   brevo:
     # This real provider is enabled only by the explicit prod or brevo profile. Local development

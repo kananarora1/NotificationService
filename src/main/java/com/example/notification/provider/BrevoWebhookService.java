@@ -5,6 +5,7 @@ import com.example.notification.metrics.NotificationMetrics;
 import com.example.notification.repository.NotificationRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -58,14 +59,21 @@ public class BrevoWebhookService {
         if (deliveryStatus.isEmpty() || notificationId.isEmpty()) {
             return;
         }
+        UUID id = notificationId.get();
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("notificationId", id.toString())) {
+            recordKnownNotification(payload, deliveryStatus.get(), id);
+        }
+    }
+
+    private void recordKnownNotification(BrevoWebhookPayload payload, DeliveryStatus outcome, UUID notificationId) {
         if (payload.id() == null || payload.id() < 0 || payload.eventTimestampSeconds() == null) {
-            log.warn("Ignoring malformed Brevo event for notification {}", notificationId.get());
+            log.warn("Ignoring malformed Brevo event for notification {}", notificationId);
             return;
         }
         // A retention job may have removed an old notification before Brevo finishes retrying
         // its callback. Acknowledge that event instead of causing provider retries forever.
-        if (!notifications.existsById(notificationId.get())) {
-            log.info("Ignoring Brevo event {} for missing notification {}", payload.id(), notificationId.get());
+        if (!notifications.existsById(notificationId)) {
+            log.info("Ignoring Brevo event {} for missing notification {}", payload.id(), notificationId);
             return;
         }
 
@@ -74,21 +82,20 @@ public class BrevoWebhookService {
             occurredAt = Instant.ofEpochSecond(payload.eventTimestampSeconds());
         } catch (DateTimeException exception) {
             log.warn("Ignoring Brevo event {} with invalid timestamp for notification {}",
-                    payload.id(), notificationId.get());
+                    payload.id(), notificationId);
             return;
         }
 
-        if (notifications.recordBrevoEvent(payload.id(), notificationId.get(), payload.event(), occurredAt,
+        if (notifications.recordBrevoEvent(payload.id(), notificationId, payload.event(), occurredAt,
                 truncate(payload.reason())) == 0) {
             return;
         }
-        DeliveryStatus outcome = deliveryStatus.get();
-        if (notifications.updateDeliveryStatus(notificationId.get(), outcome.name(), occurredAt) == 0) {
+        if (notifications.updateDeliveryStatus(notificationId, outcome.name(), occurredAt) == 0) {
             return;
         }
         if (outcome == DeliveryStatus.DELIVERED
-                && notifications.markProviderDelivered(notificationId.get(), occurredAt) == 1) {
-            notifications.findById(notificationId.get()).ifPresent(notification -> {
+                && notifications.markProviderDelivered(notificationId, occurredAt) == 1) {
+            notifications.findById(notificationId).ifPresent(notification -> {
                 metrics.sent(metrics.tenantName(notification.getTenantId()), notification.getChannel().name());
                 Duration elapsed = Duration.between(notification.getCreatedAt(), occurredAt);
                 if (!elapsed.isNegative()) {
@@ -96,12 +103,12 @@ public class BrevoWebhookService {
                 }
             });
         } else if (PERMANENT_FAILURES.contains(outcome)
-                && notifications.markProviderDead(notificationId.get(), outcome.name(), occurredAt,
+                && notifications.markProviderDead(notificationId, outcome.name(), occurredAt,
                 truncate(payload.reason()) != null ? truncate(payload.reason()) : "Brevo reported " + outcome) == 1) {
-            notifications.findById(notificationId.get()).ifPresent(notification ->
+            notifications.findById(notificationId).ifPresent(notification ->
                     metrics.dead(metrics.tenantName(notification.getTenantId())));
         }
-        log.info("Recorded Brevo {} event {} for notification {}", payload.event(), payload.id(), notificationId.get());
+        log.info("Recorded Brevo {} event {} for notification {}", payload.event(), payload.id(), notificationId);
     }
 
     private static Optional<DeliveryStatus> deliveryStatus(String event) {

@@ -8,6 +8,9 @@ import com.example.notification.service.NotificationService;
 import com.example.notification.tenant.Tenant;
 import com.example.notification.web.ApiKeyAuthInterceptor;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,6 +28,7 @@ import java.util.UUID;
 @RequestMapping("/notify")
 public class NotificationController {
 
+    private static final Logger log = LoggerFactory.getLogger(NotificationController.class);
     private static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
     /** The idempotency_key column is varchar(255). */
     private static final int MAX_IDEMPOTENCY_KEY_LENGTH = 255;
@@ -58,6 +62,10 @@ public class NotificationController {
         CreateResult result = service.create(notification, idempotencyKey);
         if (result.created()) {
             metrics.submitted(tenant.getName(), request.channel().name());
+        }
+        try (MDC.MDCCloseable ignored = MDC.putCloseable("notificationId", result.notification().getId().toString())) {
+            log.info("Notification {} {}", result.notification().getId(),
+                    result.created() ? "submitted" : "reused");
         }
         HttpStatus status = result.created() ? HttpStatus.ACCEPTED : HttpStatus.OK;
         return ResponseEntity.status(status).body(NotifyResponse.from(result.notification()));

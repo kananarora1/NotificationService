@@ -983,11 +983,11 @@ class NotificationIntegrationTest {
             assertThat(stored.getSentAt()).as("sentAt written by B, untouched by A").isEqualTo(sentAtByB);
             assertThat(stored.getAttempts()).isEqualTo(2);
 
-            // The double-send contract: called twice, delivered once. The simulator's
-            // "sent to" log line is its delivery, so that is what is counted.
+            // The double-send contract: called twice, delivered once.
             assertThat(provider.invocationTimes(id)).hasSize(2);
             List<String> messages = messages(providerLog);
-            assertThat(messages).filteredOn(m -> m.startsWith("sent to slow-ack@example.com")).hasSize(1);
+            assertThat(messages).filteredOn(m -> m.startsWith("Simulated delivery sent for notification " + id))
+                    .hasSize(1);
             assertThat(messages).filteredOn(m -> m.startsWith("already delivered " + id)).hasSize(1);
         } finally {
             release.countDown();
@@ -1614,7 +1614,7 @@ class NotificationIntegrationTest {
                 "update notifications set created_at = created_at - interval '10 minutes' where id = ?", id);
     }
 
-    /** Captures SimulatedProvider's log, where each "sent to …" line is one delivery. */
+    /** Captures simulated delivery logs. */
     private static ListAppender<ILoggingEvent> captureProviderLog() {
         return captureLog(SimulatedProvider.class);
     }

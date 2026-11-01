@@ -22,7 +22,7 @@ class SimulatedProviderTest {
 
     private final SimulatedProvider provider = new SimulatedProvider();
 
-    /** The simulator's only output: each "sent to …" line is one delivery. */
+    /** Each simulated delivery log line represents one send. */
     private final ListAppender<ILoggingEvent> log = new ListAppender<>();
 
     @BeforeEach
@@ -58,7 +58,9 @@ class SimulatedProviderTest {
         provider.send(notification);
         assertThatCode(() -> provider.send(notification)).doesNotThrowAnyException();
 
-        assertThat(messages()).filteredOn(m -> m.startsWith("sent to once@example.com")).hasSize(1);
+        assertThat(messages()).filteredOn(m -> m.startsWith("Simulated delivery sent for notification "
+                + notification.getId())).hasSize(1);
+        assertThat(messages()).noneMatch(m -> m.contains("once@example.com"));
         assertThat(messages()).filteredOn(m -> m.startsWith("already delivered " + notification.getId())).hasSize(1);
     }
 
@@ -74,7 +76,8 @@ class SimulatedProviderTest {
         ReflectionTestUtils.setField(notification, "attempts", 3);
         provider.send(notification);
 
-        assertThat(messages()).filteredOn(m -> m.startsWith("sent to flaky@example.com")).hasSize(1);
+        assertThat(messages()).filteredOn(m -> m.startsWith("Simulated delivery sent for notification "
+                + notification.getId())).hasSize(1);
         assertThat(messages()).noneMatch(m -> m.startsWith("already delivered"));
     }
 

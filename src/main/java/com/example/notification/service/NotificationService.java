@@ -219,6 +219,8 @@ public class NotificationService {
                         id, attempt, e);
                 return;
             }
+            log.warn("Delivery attempt {} failed for notification {} ({})",
+                    attempt, id, e.getClass().getSimpleName());
             throw e;
         }
         metrics.recordDeliveryLatency(Duration.ofNanos(System.nanoTime() - startNanos));
@@ -243,6 +245,7 @@ public class NotificationService {
 
         metrics.sent(tenant, notification.getChannel().name());
         metrics.recordEndToEndLatency(Duration.between(notification.getCreatedAt(), sentAt));
+        log.info("Notification {} marked SENT after synchronous delivery", id);
     }
 
     /**

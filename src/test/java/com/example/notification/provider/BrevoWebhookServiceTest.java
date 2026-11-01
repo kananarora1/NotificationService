@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.MDC;
 
 import java.time.Instant;
 import java.util.UUID;
@@ -38,6 +39,20 @@ class BrevoWebhookServiceTest {
 
         verify(notifications).markProviderDelivered(notificationId,
                 Instant.parse("2026-01-01T00:00:00Z"));
+    }
+
+    @Test
+    void callbackSetsAndClearsNotificationId() {
+        UUID notificationId = UUID.randomUUID();
+        when(notifications.existsById(notificationId)).thenAnswer(invocation -> {
+            assertThat(MDC.get("notificationId")).isEqualTo(notificationId.toString());
+            return false;
+        });
+
+        new BrevoWebhookService(notifications, metrics)
+                .record(payload(notificationId, 706L, "delivered", 1_767_225_600L));
+
+        assertThat(MDC.get("notificationId")).isNull();
     }
 
     @Test
