@@ -63,9 +63,10 @@ jobs:
           severity: HIGH,CRITICAL
           format: table
           output: trivy-image.txt
-          exit-code: "0"
+          exit-code: "1"
           timeout: 10m
       - name: Save vulnerability report
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: vulnerability-report-${{ github.sha }}
