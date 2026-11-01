@@ -19,7 +19,7 @@
 
     <properties>
         <java.version>21</java.version>
-        <rabbit-amqp-client.version>5.33.1</rabbit-amqp-client.version>
+        <rabbit-amqp-client.version>5.34.0</rabbit-amqp-client.version>
         <!--
           Bump Testcontainers so its bundled (shaded) docker-java client knows Docker
           API 1.44, the minimum required by Docker Engine 29. Combined with the surefire
