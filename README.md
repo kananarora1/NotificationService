@@ -79,6 +79,15 @@ Keep Docker Desktop running. Run commands from the repository root.
    ```
 
    Keep the source file outside Git. This command does not print its contents.
+   Create a separate token for Alertmanager's private incident-agent webhook:
+
+   ```bash
+   kubectl --context kind-relaynest -n notification-service get secret incident-agent-webhook >/dev/null 2>&1 || \
+     openssl rand -hex 32 | kubectl --context kind-relaynest -n notification-service \
+       create secret generic incident-agent-webhook --from-file=token=/dev/stdin
+   ```
+
+   Keep this token in the cluster Secret only; do not add it to `.env` or Git.
 
 4. Apply shared resources, then deploy the latest image published by passing CI:
 
@@ -88,9 +97,14 @@ Keep Docker Desktop running. Run commands from the repository root.
    bash scripts/install-kind-deployer.sh
    kubectl --context kind-relaynest -n notification-service rollout status deployment/notification-service --timeout=180s
    kubectl --context kind-relaynest -n notification-service rollout status deployment/prometheus --timeout=180s
+   kubectl --context kind-relaynest -n notification-service rollout status deployment/incident-agent --timeout=180s
+   kubectl --context kind-relaynest -n notification-service rollout status deployment/ollama --timeout=1800s
    ```
 
-   For a private GHCR package, first authenticate with `docker login ghcr.io`
+   The first Ollama pull includes a roughly 2.7 GB ARM image and an approximately
+   0.8 GB Gemma 3 1B model; later pod restarts reuse the model PVC. The agent
+   still sends a factual report if the model is unavailable. For a private GHCR
+   package, first authenticate with `docker login ghcr.io`
    using a credential permitted to read it. Do not print or commit the credential.
    The deployer loads only the node's CPU architecture, avoiding kind's failure to
    import missing variants from a multi-platform Docker image. Images are preloaded
@@ -98,7 +112,8 @@ Keep Docker Desktop running. Run commands from the repository root.
    The macOS LaunchAgent checks `main` every two minutes while the Mac and Docker
    Desktop are running. Re-run `scripts/install-kind-deployer.sh` after changing the
    deployer or its template. Its log is at
-   `~/Library/Logs/relaynest-kind-deployer.log`.
+   `~/Library/Logs/relaynest-kind-deployer.log`. The installer also snapshots
+   the shared manifests and incident-agent template for the local deployer.
    Flyway initializes a fresh database automatically. Do not reset an existing
    database just to silence a migration warning; check its history first.
 
@@ -126,13 +141,13 @@ have no package write permission. Publishing uses the job-scoped `GITHUB_TOKEN` 
 Actions are pinned to commit hashes, jobs have time limits, and test reports are
 retained as workflow artifacts for 14 days.
 
-The local release boundary is automatic: the deployer reads `main`, waits until its
-full-SHA image is available from the test-gated publish job, verifies the image's
-revision label, renders `k8s/deployment-template.yaml`, and waits for rollout
-readiness. A failed rollout is undone when a prior revision exists, and that SHA
-is held for inspection. The application Deployment is deliberately excluded from
-`k8s/kustomization.yaml`, so
-reapplying shared manifests cannot revert it to an older hard-coded image.
+The local release boundary is automatic: the deployer reads `main`, waits until
+both full-SHA application and incident-agent images are available from the
+test-gated publish job, verifies their revision labels, renders their deployment
+templates, and waits for rollout readiness. A failed rollout is undone when a
+prior revision exists, and that SHA is held for inspection. Both image Deployments
+are deliberately excluded from `k8s/kustomization.yaml`, so reapplying shared
+manifests cannot revert them to older hard-coded images.
 The Mac is not a GitHub Actions runner, and deployments stop while it is offline.
 A SHA tag is traceable but registry tags can technically be overwritten. Record
 the registry digest as the immutable artifact identity too:
@@ -142,6 +157,7 @@ git rev-parse HEAD
 docker buildx imagetools inspect "$IMAGE"
 docker image inspect "$IMAGE" --format '{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
 kubectl --context kind-relaynest -n notification-service get deployment notification-service -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl --context kind-relaynest -n notification-service get deployment incident-agent -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 kubectl --context kind-relaynest -n notification-service get pods -o wide
 ```
 
@@ -192,12 +208,14 @@ on failure. It assumes the local simulator, one app replica, seeded development
 tenant `key-acme`, and no restart during measurement. Do not run it against Brevo.
 Override `BASE_URL`, `API_KEY`, `KUBE_CONTEXT`, or `MANAGEMENT_API_TOKEN` if needed.
 
-Prometheus scrapes `notification-service:80/actuator/prometheus` every five seconds.
+Prometheus scrapes `notification-service:80/actuator/prometheus` and the private
+incident agent at `incident-agent:8080/metrics` every five seconds.
 Verify collection, not just endpoint availability:
 
 ```bash
 curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=up{job="notification-service"}' | jq .data.result
 curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=notifications_sent_total' | jq .data.result
+curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=up{job="incident-agent"}' | jq .data.result
 ```
 
 Useful queries include `notifications_dead_total`, `notifications_failed_attempt_total`,
@@ -215,6 +233,32 @@ those failures should not restart healthy JVMs. Aggregate `/actuator/health` can
 still report DOWN for a degraded dependency. The pod gets 90 seconds to drain,
 matching the application's multiple shutdown phases.
 
+### Incident analysis
+
+The `RedisRateLimiterFailOpen` alert still emails the developer directly. It
+also calls the internal incident agent, which reads the five-minute fail-open
+counter, application readiness, and a bounded sample of pod logs. It counts
+matching Redis errors without sending raw logs or recipient data to the model.
+Gemma 3 1B runs in a separate, internal Ollama pod and selects a diagnostic
+focus from a restricted set. The agent checks that selection against the facts
+and marks it unverified. If inference fails, the email contains only the factual
+assessment. The agent cannot change notifications or Kubernetes workloads.
+
+Check the agent's JSON lifecycle logs and Prometheus counters after an alert:
+
+```bash
+kubectl --context kind-relaynest -n notification-service logs deployment/incident-agent --tail=40
+curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=incident_agent_reports_sent_total' | jq .data.result
+curl -fsSG http://127.0.0.1:19090/api/v1/query --data-urlencode 'query=incident_agent_model_fallbacks_total' | jq .data.result
+kubectl --context kind-relaynest -n notification-service get pods,pvc
+```
+
+If a report is missing, check the Alertmanager and agent logs, model pod
+readiness, and Gmail Secret. Alertmanager retries a failed webhook; a retry near
+an SMTP timeout can produce a duplicate email. This local agent handles only
+the Redis fail-open alert, not every failure mode. Ollama has no public Service,
+but cluster NetworkPolicy is not enforced in this kind setup.
+
 ### Security review and demo limits
 
 Application pods run as UID 10001 with a read-only root filesystem, dropped
@@ -228,10 +272,11 @@ This is a local demo, not a production security certification. Development tenan
 keys are public, metrics are unauthenticated within the cluster, and there is no
 NetworkPolicy. Existing Compose dependency ports bind to host interfaces; use a
 trusted local machine/network and restrict those ports before any public deployment.
-The simulator logs test recipient addresses; use synthetic data only. Logs have
-timestamps and notification IDs but are not JSON structured logs, and distributed
-tracing is not implemented. Dependency/image vulnerability scanning is still a
-follow-up; no claim of zero vulnerabilities is made. Single replicas and local
+The simulator logs test recipient addresses; use synthetic data only. Application
+logs have timestamps and notification IDs but are not JSON structured logs; agent
+lifecycle logs are JSON. Distributed tracing is not implemented. CI scans both
+application images for high/critical vulnerabilities, but a passing scan is not
+a claim of zero vulnerabilities. Single replicas and local
 volumes provide no high availability. Resource sizes are demo settings, not a
 capacity guarantee. Do not run the public development keys in production.
 
@@ -280,8 +325,8 @@ while `SENDING`). A `Tenant` has: `id`, `name`, unique `apiKeyHash`, and
 | status    | meaning                                                              |
 |-----------|---------------------------------------------------------------------|
 | `PENDING` | accepted, awaiting delivery — including between retries              |
-| `SENDING` | claimed by one consumer under a lease, provider call in flight       |
-| `SENT`    | provider call succeeded (simulated locally; Brevo acceptance is not inbox delivery) |
+| `SENDING` | claimed by a consumer, or accepted by Brevo while awaiting a delivery webhook |
+| `SENT`    | simulated delivery completed locally, or Brevo reported `delivered` through its webhook |
 | `DEAD`    | permanently failed: retries exhausted and the message dead-lettered  |
 
 Delivery is handled by `SimulatedProvider`: it sleeps ~800ms to mimic a slow
