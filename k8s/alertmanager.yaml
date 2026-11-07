@@ -18,6 +18,10 @@ data:
       group_interval: 5m
       repeat_interval: 4h
       routes:
+        - receiver: incident-agent
+          matchers:
+            - alertname="RedisRateLimiterFailOpen"
+          continue: true
         - receiver: gmail
           matchers:
             - alertname="BrevoDeliveryConfirmationOverdue"
@@ -30,6 +34,14 @@ data:
         email_configs:
           - to: arorakanan63@gmail.com
             send_resolved: true
+      - name: incident-agent
+        webhook_configs:
+          - url: http://incident-agent:8080/alerts
+            send_resolved: false
+            timeout: 75s
+            http_config:
+              authorization:
+                credentials_file: /run/secrets/webhook/token
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -90,6 +102,9 @@ spec:
             - name: gmail-password
               mountPath: /run/secrets
               readOnly: true
+            - name: webhook-token
+              mountPath: /run/secrets/webhook
+              readOnly: true
             - name: data
               mountPath: /alertmanager
       volumes:
@@ -103,6 +118,13 @@ spec:
             items:
               - key: alertmanager_gmail_app_password
                 path: alertmanager_gmail_app_password
+        - name: webhook-token
+          secret:
+            secretName: incident-agent-webhook
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token
         - name: data
           emptyDir:
             sizeLimit: 128Mi

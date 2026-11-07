@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: incident-agent
+  namespace: notification-service
+  annotations:
+    relaynest.tech/release-template-sha256: TEMPLATE_SHA256
+    kubernetes.io/change-cause: "Deploy ghcr.io/kananarora1/incident-agent:RELEASE_SHA"
+  labels:
+    app.kubernetes.io/name: incident-agent
+    app.kubernetes.io/version: RELEASE_SHA
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: incident-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: incident-agent
+        app.kubernetes.io/version: RELEASE_SHA
+    spec:
+      serviceAccountName: incident-agent
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: incident-agent
+          image: ghcr.io/kananarora1/incident-agent:RELEASE_SHA
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: incident-agent-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 12
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: gmail-password
+              mountPath: /run/secrets/gmail
+              readOnly: true
+            - name: webhook-token
+              mountPath: /run/secrets/webhook
+              readOnly: true
+      volumes:
+        - name: gmail-password
+          secret:
+            secretName: alertmanager-gmail
+            defaultMode: 0440
+            items:
+              - key: alertmanager_gmail_app_password
+                path: alertmanager_gmail_app_password
+        - name: webhook-token
+          secret:
+            secretName: incident-agent-webhook
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token

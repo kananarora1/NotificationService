@@ -19,6 +19,10 @@ data:
         metrics_path: /actuator/prometheus
         static_configs:
           - targets: ["notification-service:80"]
+      - job_name: incident-agent
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["incident-agent:8080"]
   alerts.yml: |
     groups:
       - name: notification-service-delivery

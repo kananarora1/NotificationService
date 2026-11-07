@@ -6,3 +6,5 @@ resources:
   - service.yaml
   - prometheus.yaml
   - alertmanager.yaml
+  - incident-agent.yaml
+  - ollama.yaml
