@@ -13,7 +13,10 @@ RUN --mount=type=cache,target=/root/.m2 mvn -B -Dmaven.test.skip=true package \
 # Run as non-root.
 FROM eclipse-temurin:21-jre-jammy@sha256:1eac8b8fee11ca7d6725a48bc5d41992ed1561504ebae25490d2d062847e8269 AS runtime
 
-RUN groupadd --system --gid 10001 spring \
+RUN apt-get update \
+    && apt-get install --only-upgrade -y apt libapt-pkg6.0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 spring \
     && useradd --system --uid 10001 --gid spring --create-home spring
 
 WORKDIR /app

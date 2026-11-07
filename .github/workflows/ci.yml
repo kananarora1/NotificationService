@@ -65,7 +65,9 @@ jobs:
           tags: incident-agent:scan-${{ github.sha }}
           cache-from: type=gha
       - name: Report image and runtime dependency vulnerabilities
+        id: app_scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
         with:
           image-ref: notification-service:scan-${{ github.sha }}
           version: v0.76.1
@@ -84,7 +86,9 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Scan incident agent image
+        id: agent_scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
         with:
           image-ref: incident-agent:scan-${{ github.sha }}
           version: v0.76.1
@@ -102,6 +106,11 @@ jobs:
           path: trivy-agent-image.txt
           if-no-files-found: error
           retention-days: 14
+      - name: Enforce vulnerability gate
+        if: always()
+        run: |
+          test '${{ steps.app_scan.outcome }}' = success
+          test '${{ steps.agent_scan.outcome }}' = success
 
   publish:
     needs: [test, security-scan]
