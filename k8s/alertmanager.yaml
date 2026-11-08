@@ -27,6 +27,9 @@ data:
             - alertname="BrevoDeliveryConfirmationOverdue"
         - receiver: gmail
           matchers:
+            - alertname="MetricsPollStale"
+        - receiver: gmail
+          matchers:
             - alertname="RedisRateLimiterFailOpen"
     receivers:
       - name: discard

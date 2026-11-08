@@ -14,6 +14,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -59,6 +60,8 @@ public class MetricsPoller {
     private final AtomicLong sendQueueDepth = new AtomicLong();
     private final AtomicLong dlqDepth = new AtomicLong();
     private final AtomicLong parkingLotDepth = new AtomicLong();
+    private final AtomicLong databaseLastSuccess = new AtomicLong();
+    private final AtomicLong queueLastSuccess = new AtomicLong();
 
     public MetricsPoller(MeterRegistry registry,
                          NotificationRepository repository,
@@ -98,19 +101,32 @@ public class MetricsPoller {
                 .description("Messages ready in the queue")
                 .tag("queue", RabbitConfig.PARKING_LOT_QUEUE)
                 .register(registry);
+        Gauge.builder("metrics.poll.last_success_timestamp_seconds", databaseLastSuccess, AtomicLong::get)
+                .description("Unix timestamp of the last complete database metrics refresh")
+                .tag("source", "database")
+                .register(registry);
+        Gauge.builder("metrics.poll.last_success_timestamp_seconds", queueLastSuccess, AtomicLong::get)
+                .description("Unix timestamp of the last complete RabbitMQ metrics refresh")
+                .tag("source", "rabbitmq")
+                .register(registry);
     }
-
-    // Never let a metrics refresh failure disrupt the app; keep the last values.
 
     @Scheduled(fixedRate = 5000)
     public void pollDatabase() {
         try {
-            pending.set(repository.countByStatus(NotificationStatus.PENDING));
-            sending.set(repository.countByStatus(NotificationStatus.SENDING));
-            stuckSending.set(repository.countExpiredLeases(reconcilerProperties.leaseTimeout().toMillis()));
-            awaitingConfirmation.set(repository.countAwaitingConfirmation());
-            overdueConfirmation.set(repository.countOverdueConfirmations(CONFIRMATION_TIMEOUT.toMillis()));
-            unpublishedPending.set(repository.countUnpublishedPending(reconcilerProperties.publishGrace().toMillis()));
+            long pendingCount = repository.countByStatus(NotificationStatus.PENDING);
+            long sendingCount = repository.countByStatus(NotificationStatus.SENDING);
+            long stuckCount = repository.countExpiredLeases(reconcilerProperties.leaseTimeout().toMillis());
+            long awaitingCount = repository.countAwaitingConfirmation();
+            long overdueCount = repository.countOverdueConfirmations(CONFIRMATION_TIMEOUT.toMillis());
+            long unpublishedCount = repository.countUnpublishedPending(reconcilerProperties.publishGrace().toMillis());
+            pending.set(pendingCount);
+            sending.set(sendingCount);
+            stuckSending.set(stuckCount);
+            awaitingConfirmation.set(awaitingCount);
+            overdueConfirmation.set(overdueCount);
+            unpublishedPending.set(unpublishedCount);
+            databaseLastSuccess.set(Instant.now().getEpochSecond());
         } catch (RuntimeException e) {
             log.warn("Failed to refresh the database gauges", e);
         }
@@ -119,21 +135,27 @@ public class MetricsPoller {
     @Scheduled(fixedRate = 5000)
     public void pollQueues() {
         try {
-            sendQueueDepth.set(queueDepth(RabbitConfig.SEND_QUEUE));
-            dlqDepth.set(queueDepth(RabbitConfig.DEAD_LETTER_QUEUE));
-            parkingLotDepth.set(queueDepth(RabbitConfig.PARKING_LOT_QUEUE));
+            long sendCount = queueDepth(RabbitConfig.SEND_QUEUE);
+            long deadLetterCount = queueDepth(RabbitConfig.DEAD_LETTER_QUEUE);
+            long parkingCount = queueDepth(RabbitConfig.PARKING_LOT_QUEUE);
+            sendQueueDepth.set(sendCount);
+            dlqDepth.set(deadLetterCount);
+            parkingLotDepth.set(parkingCount);
+            queueLastSuccess.set(Instant.now().getEpochSecond());
         } catch (RuntimeException e) {
             log.warn("Failed to refresh the queue depth gauges", e);
         }
     }
 
     private long queueDepth(String queue) {
-        // getQueueProperties returns null if the queue doesn't exist yet.
         Properties props = amqpAdmin.getQueueProperties(queue);
         if (props == null) {
-            return 0L;
+            throw new IllegalStateException("Queue unavailable: " + queue);
         }
         Object count = props.get(RabbitAdmin.QUEUE_MESSAGE_COUNT);
-        return count instanceof Number number ? number.longValue() : 0L;
+        if (!(count instanceof Number number)) {
+            throw new IllegalStateException("Queue depth unavailable: " + queue);
+        }
+        return number.longValue();
     }
 }

@@ -39,6 +39,22 @@ data:
                 since Brevo accepted them without a delivery or permanent-failure webhook.
                 Check Brevo webhook configuration and delivery logs. Do not resend
                 automatically: Brevo may already have delivered them.
+      - name: notification-service-metrics
+        rules:
+          - alert: MetricsPollStale
+            expr: >-
+              (time() - metrics_poll_last_success_timestamp_seconds > 60)
+              or absent(metrics_poll_last_success_timestamp_seconds{source="database"})
+              or absent(metrics_poll_last_success_timestamp_seconds{source="rabbitmq"})
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: "Notification metrics refresh is stale"
+              description: >-
+                The {{ $labels.source }} metrics snapshot has not refreshed for over
+                a minute, or its metric is absent. Backlog gauges may be stale;
+                check application logs and dependency health.
       - name: notification-service-rate-limiter
         rules:
           - alert: RedisRateLimiterFailOpen
