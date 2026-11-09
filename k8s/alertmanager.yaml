@@ -26,6 +26,10 @@ data:
           matchers:
             - alertname="BrevoDeliveryConfirmationOverdue"
           continue: true
+        - receiver: incident-agent
+          matchers:
+            - alertname="MetricsPollStale"
+          continue: true
         - receiver: gmail
           matchers:
             - alertname="BrevoDeliveryConfirmationOverdue"
