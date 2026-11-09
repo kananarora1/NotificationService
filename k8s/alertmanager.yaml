@@ -22,6 +22,10 @@ data:
           matchers:
             - alertname="RedisRateLimiterFailOpen"
           continue: true
+        - receiver: incident-agent
+          matchers:
+            - alertname="BrevoDeliveryConfirmationOverdue"
+          continue: true
         - receiver: gmail
           matchers:
             - alertname="BrevoDeliveryConfirmationOverdue"

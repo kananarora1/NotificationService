@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from incident_agent.agent import Config, IncidentAgent, collect_evidence, explain_with_model, format_report
+from incident_agent.agent import (Config, IncidentAgent, collect_delivery_evidence, collect_evidence,
+                                  explain_delivery_with_model, explain_with_model, format_delivery_report,
+                                  format_report)
 
 
 def config() -> Config:
@@ -31,8 +33,21 @@ def evidence(fail_open=5, app_up=1, errors=2):
     }
 
 
-def alert(fingerprint="abc12345", status="firing", name="RedisRateLimiterFailOpen"):
-    return {"alerts": [{"status": status, "fingerprint": fingerprint, "labels": {"alertname": name}}]}
+def delivery_evidence(overdue=2, age=8, app_up=1, warnings=0):
+    return {
+        "overdue_confirmation": overdue,
+        "awaiting_confirmation": 4,
+        "database_poll_age_seconds": age,
+        "app_up": app_up,
+        "pods": [{"name": "notification-service-abc", "phase": "Running", "ready": True, "restarts": 0}],
+        "brevo_event_warning_lines_15m": warnings,
+        "gaps": [],
+    }
+
+
+def alert(fingerprint="abc12345", status="firing", name="RedisRateLimiterFailOpen", starts_at=""):
+    return {"alerts": [{"status": status, "fingerprint": fingerprint,
+                        "startsAt": starts_at, "labels": {"alertname": name}}]}
 
 
 class IncidentAgentTest(unittest.TestCase):
@@ -84,6 +99,57 @@ class IncidentAgentTest(unittest.TestCase):
         self.assertNotIn("notifications were lost", body)
         recovered = format_report(evidence(fail_open=0, errors=0), None)
         self.assertIn("may have recovered", recovered)
+
+    @patch("incident_agent.agent.send_email")
+    @patch("incident_agent.agent.explain_delivery_with_model", return_value=None)
+    @patch("incident_agent.agent.collect_delivery_evidence", return_value=delivery_evidence())
+    def test_delivery_alert_uses_its_own_report_and_dedupe_key(self, collector, model, email):
+        agent = IncidentAgent(config())
+        self.assertEqual(agent.accept(alert(name="BrevoDeliveryConfirmationOverdue")), 200)
+        self.assertEqual(agent.accept(alert(name="BrevoDeliveryConfirmationOverdue")), 200)
+        collector.assert_called_once()
+        model.assert_called_once()
+        self.assertEqual(email.call_count, 1)
+        self.assertEqual(email.call_args.args[2], "BrevoDeliveryConfirmationOverdue")
+        self.assertIn("does not prove non-delivery", email.call_args.args[1])
+        self.assertNotIn("Redis", email.call_args.args[1])
+
+    def test_delivery_report_marks_stale_and_recovered_snapshots(self):
+        stale = format_delivery_report(delivery_evidence(overdue=2, age=90), None)
+        self.assertIn("stale or unavailable", stale)
+        self.assertNotIn("still lack a recorded delivery", stale)
+        recovered = format_delivery_report(delivery_evidence(overdue=0), None)
+        self.assertIn("may have recovered", recovered)
+        self.assertIn("Do not resend", recovered)
+
+    @patch("incident_agent.agent.send_email")
+    @patch("incident_agent.agent.explain_delivery_with_model", return_value=None)
+    @patch("incident_agent.agent.collect_delivery_evidence", return_value=delivery_evidence())
+    def test_new_alert_episode_is_not_suppressed(self, collector, model, email):
+        agent = IncidentAgent(config())
+        first = alert(name="BrevoDeliveryConfirmationOverdue", starts_at="2026-11-09T10:00:00Z")
+        second = alert(name="BrevoDeliveryConfirmationOverdue", starts_at="2026-11-09T11:00:00.123456789Z")
+        self.assertEqual(agent.accept(first), 200)
+        self.assertEqual(agent.accept(first), 200)
+        self.assertEqual(agent.accept(second), 200)
+        self.assertEqual(email.call_count, 2)
+        self.assertEqual(agent.accept(alert(name="BrevoDeliveryConfirmationOverdue",
+                                            starts_at="not-a-date")), 400)
+
+    @patch("incident_agent.agent.kubernetes_get")
+    @patch("incident_agent.agent.prometheus_value")
+    def test_delivery_evidence_counts_warnings_without_exposing_logs(self, metric, kube):
+        metric.side_effect = [2.0, 4.0, 8.0, 1.0]
+        kube.side_effect = [
+            json.dumps({"items": [{"metadata": {"name": "notification-service-abc"},
+                                   "status": {"phase": "Running", "containerStatuses": [
+                                       {"name": "notification-service", "ready": True, "restartCount": 0}]}}]}),
+            "Ignoring malformed Brevo event for notification private@example.com\npassword=hidden\n",
+        ]
+        result = collect_delivery_evidence(config())
+        self.assertEqual(result["brevo_event_warning_lines_15m"], 1)
+        self.assertNotIn("private@example.com", json.dumps(result))
+        self.assertNotIn("password=hidden", json.dumps(result))
 
     @patch("incident_agent.agent.kubernetes_get")
     @patch("incident_agent.agent.prometheus_value")
@@ -141,6 +207,35 @@ class IncidentAgentTest(unittest.TestCase):
             with self.subTest(result=result), patch("incident_agent.agent.urlopen", return_value=FakeResponse(result)):
                 with self.assertRaises(ValueError):
                     explain_with_model(model_config, evidence())
+
+    def test_delivery_model_requires_fresh_direct_evidence(self):
+        model_config = Config(**{**config().__dict__, "model_url": "http://ollama:11434/api/chat",
+                                 "model_name": "gemma3:1b"})
+
+        class FakeResponse:
+            def __init__(self, result):
+                self.result = result
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def read(self, *_):
+                return json.dumps({"message": {"content": json.dumps(self.result)}}).encode()
+
+        valid = {"focus": "delivery_confirmation", "confidence": "low",
+                 "evidence_keys": ["overdue_confirmation"]}
+        with patch("incident_agent.agent.urlopen", return_value=FakeResponse(valid)):
+            self.assertIn("unverified", explain_delivery_with_model(model_config, delivery_evidence()))
+        for facts, result in (
+            (delivery_evidence(age=90), valid),
+            (delivery_evidence(), {"focus": "delivery_confirmation", "confidence": "high",
+                                   "evidence_keys": ["brevo_event_warning_lines_15m"]}),
+            (delivery_evidence(overdue=0), valid),
+        ):
+            with self.subTest(facts=facts, result=result), patch(
+                    "incident_agent.agent.urlopen", return_value=FakeResponse(result)):
+                with self.assertRaises(ValueError):
+                    explain_delivery_with_model(model_config, facts)
 
     def test_config_rejects_token_sent_over_plain_http(self):
         with tempfile.TemporaryDirectory() as directory:
