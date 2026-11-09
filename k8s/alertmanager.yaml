@@ -49,7 +49,7 @@ data:
         webhook_configs:
           - url: http://incident-agent:8080/alerts
             send_resolved: false
-            timeout: 75s
+            timeout: 100s
             http_config:
               authorization:
                 credentials_file: /run/secrets/webhook/token

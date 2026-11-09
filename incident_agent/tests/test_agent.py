@@ -172,10 +172,13 @@ class IncidentAgentTest(unittest.TestCase):
         current = evidence(overdue_confirmation=2)
         findings = derive_findings(current)
         good = {"lead_id": "confirmation_overdue", "confidence": "medium"}
-        with patch("incident_agent.investigation.urlopen", return_value=model_response(good)):
+        with patch("incident_agent.investigation.urlopen", return_value=model_response(good)) as request:
             selected = prioritize_with_model(config(model=True), "BrevoDeliveryConfirmationOverdue",
                                              current, findings)
         self.assertEqual(selected[0].key, "confirmation_overdue")
+        prompt = json.loads(request.call_args.args[0].data)["messages"][0]["content"]
+        self.assertIn("overdue_confirmation", prompt)
+        self.assertNotIn("parking_lot_depth", prompt)
         for bad in (
             {"lead_id": "redis_app_errors", "confidence": "high"},
             {"lead_id": "confirmation_overdue", "confidence": "certain"},

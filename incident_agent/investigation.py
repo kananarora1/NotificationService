@@ -226,24 +226,23 @@ def prioritize_with_model(config: Config, alert_name: str, evidence: dict,
         "required": ["lead_id", "confidence"],
         "additionalProperties": False,
     }
+    values = {**evidence["metrics"], **evidence["logs"],
+              "pods_ready": evidence["pods_ready"], "pods_total": evidence["pods_total"]}
+    candidates = [{"id": item.key, "summary": item.summary,
+                   "evidence": {key: values[key] for key in item.evidence_keys}} for item in findings]
     prompt = (
-        "Prioritize one diagnostic lead for this alert. These are observed symptoms, not proven root causes. "
-        "Use only the supplied candidates; do not infer delivery failure, provider outage, or a broken webhook. "
-        "Choose the lead most useful to investigate first, not necessarily the largest number. "
-        + json.dumps({"alert_name": alert_name, "metrics": evidence["metrics"], "logs": evidence["logs"],
-                      "pods_ready": evidence["pods_ready"], "pods_total": evidence["pods_total"],
-                      "gaps": evidence["gaps"],
-                      "candidates": [{"id": item.key, "summary": item.summary,
-                                      "evidence_keys": item.evidence_keys} for item in findings]})
+        "Choose the most useful diagnostic lead to investigate first for this alert. "
+        "Candidates are observed symptoms, not proven root causes. Do not invent a cause. "
+        + json.dumps({"alert": alert_name, "candidates": candidates})
     )
     payload = json.dumps({"model": config.model_name, "stream": False, "format": schema,
-                          "options": {"temperature": 0, "num_predict": 80},
+                          "options": {"temperature": 0, "num_predict": 50},
                           "messages": [{"role": "user", "content": prompt}]}).encode()
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if config.model_key_file:
         key = Path(config.model_key_file).read_text(encoding="utf-8").strip()
         headers["Authorization"] = f"Bearer {key}"
-    with urlopen(Request(config.model_url, data=payload, headers=headers, method="POST"), timeout=25) as response:
+    with urlopen(Request(config.model_url, data=payload, headers=headers, method="POST"), timeout=55) as response:
         answer = json.loads(response.read(16384))
     result = json.loads(answer["message"]["content"])
     if (not isinstance(result, dict) or set(result) != {"lead_id", "confidence"}
